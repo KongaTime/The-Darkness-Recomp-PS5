@@ -13,7 +13,9 @@
 #include "native_timed_wait.h"
 #include "renderer/engine/engine_performance.h"
 #include "renderer/engine/subtitle_font.h"
+#if defined(_WIN32)
 #include "renderer/d3d11/display_context_d3d11.h"
+#endif
 #include "objects.h"
 #include "storage.h"
 #include "ppc_image_metadata.h"
@@ -966,6 +968,11 @@ PPC_FUNC(__imp__DbgPrint) {
         const char* message = reinterpret_cast<const char*>(base + address);
         size_t length = strnlen(message, 4096);
         fprintf(stderr, "[Guest Output] %.*s\n", static_cast<int>(length), message);
+        // D3D's own fatal diagnoses name no caller; the guest trail locates the
+        // check that made them.
+        const std::string_view text(message, length);
+        if (text.find("GPU is hung") != std::string_view::npos || text.find("HSIO training") != std::string_view::npos)
+            printContext(ctx);
     }
     ctx.r3.u64 = 0;
 }
@@ -1105,6 +1112,10 @@ bool achievementSpansOverlap(uint32_t a, uint32_t aBytes, uint32_t b, uint32_t b
 }
 std::u16string achievementWide(std::string_view text) {
     if (text.empty()) return {};
+#if !defined(_WIN32)
+    // wchar_t is UTF-32 on the console; the guest wants UTF-16.
+    return win32Utf8ToUtf16(text);
+#endif
     const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
                                          int(text.size()), nullptr, 0);
     if (!count) return {};
@@ -1199,8 +1210,10 @@ void enumerateAchievements(PPCContext& ctx, const std::shared_ptr<KernelObject>&
 // on success paths.
 static void TraceStorageImport(const char* kind, uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
                                uint32_t r7, uint32_t extra, uint32_t result) {
+#if defined(_WIN32)
     if (!profileEngineCpu)
         return;
+#endif
     static std::atomic<uint32_t> storageEvents{0};
     static std::mutex storageMutex;
     if (storageEvents.load(std::memory_order_relaxed) >= 16)
@@ -1285,7 +1298,7 @@ PPC_FUNC(__imp__XamShowDeviceSelectorUI) {
     }
     memory->write32(deviceOut, Storage::kSaveDeviceId);
     std::fprintf(stderr, "[NativeStorage] Device selector: user=%u -> device 1 (%ls)\n", user,
-                 Storage::SaveRoot().c_str());
+                 Storage::SaveRoot().wstring().c_str());
     ctx.r3.u64 = completeStorageOverlapped(ctx, overlapped, 0, 4, 0);
 }
 PPC_FUNC(__imp__XamContentGetDeviceState) {
@@ -1495,6 +1508,10 @@ PPC_FUNC(__imp__XamContentCreateEx) {
     // qword content size occupies r10.u64 and the overlapped pointer is stack84.
     uint32_t user = ctx.r3.u32, rootPtr = ctx.r4.u32, dataPtr = ctx.r5.u32;
     uint32_t flags = ctx.r6.u32, dispOut = ctx.r7.u32, licenseOut = ctx.r8.u32;
+#if !defined(_WIN32)
+    std::fprintf(stderr, "[ContentCreate] user=%u root=%08X data=%08X flags=%08X disp=%08X license=%08X lr=%08X\n",
+                 user, rootPtr, dataPtr, flags, dispOut, licenseOut, uint32_t(ctx.lr));
+#endif
     uint64_t stack64 = uint64_t(ctx.r1.u32) + 84;
     if (stack64 + 4 > 0x100000000ull) {
         ctx.r3.u64 = ERROR_INVALID_PARAMETER;
@@ -1518,7 +1535,13 @@ PPC_FUNC(__imp__XamContentCreateEx) {
     }
     auto root = readGuestCString(rootPtr, 33);
     Storage::ContentInfo content;
-    if (!root || !Storage::ValidRootName(*root) || !parseGuestContent(dataPtr, content)) {
+    const bool parsed = parseGuestContent(dataPtr, content);
+#if !defined(_WIN32)
+    std::fprintf(stderr, "[ContentCreate] alias=%s parsed=%u file=%s type=%u device=%u overlap=%08X\n",
+                 root ? root->c_str() : "<invalid>", unsigned(parsed), content.fileName.c_str(),
+                 content.contentType, content.deviceId, overlapped);
+#endif
+    if (!root || !Storage::ValidRootName(*root) || !parsed) {
         ctx.r3.u64 = ERROR_INVALID_PARAMETER;
         return;
     }
@@ -1535,6 +1558,9 @@ PPC_FUNC(__imp__XamContentCreateEx) {
     uint32_t disp = 0;
     std::filesystem::path path;
     uint32_t result = Storage::CreateContent(*root, content, flags, &disp, &path);
+#if !defined(_WIN32)
+    std::fprintf(stderr, "[ContentCreate] result=%08X disposition=%u\n", result, disp);
+#endif
     if (!result) {
         if (dispOut) memory->write32(dispOut, disp);
         if (licenseOut) memory->write32(licenseOut, 0);
@@ -1913,7 +1939,13 @@ PPC_FUNC(__imp__NetDll_XNetRandom) {
 
 namespace DarkRecomp::Native {
 void DarkRecomp::Native::setNativeDisplayContext(DarkRecomp::CDisplayContextD3D11* display) { nativeDisplay = display; }
-void DarkRecomp::Native::nativeDisplayPresent() { if (nativeDisplay) nativeDisplay->Present(); }
+// The console presents the frames the engine publishes (app/ps5/title_main.cpp
+// consumes them), so it has no D3D11 display to present here.
+void DarkRecomp::Native::nativeDisplayPresent() {
+#if defined(_WIN32)
+    if (nativeDisplay) nativeDisplay->Present();
+#endif
+}
 
 void initializeKernel() {
     registerCurrentThread();
@@ -2686,6 +2718,13 @@ PPC_FUNC(__imp__VdEnableDisableClockGating) { StallProfiler::Scope stallProfile(
 PPC_FUNC(__imp__KeEnterCriticalRegion) { StallProfiler::Scope stallProfile(StallProfiler::Section::Other, __func__, ctx.lastFunction, uint32_t(ctx.lr)); ctx.r3.u64 = 0; }
 PPC_FUNC(__imp__KeLeaveCriticalRegion) { StallProfiler::Scope stallProfile(StallProfiler::Section::Other, __func__, ctx.lastFunction, uint32_t(ctx.lr)); ctx.r3.u64 = 0; }
 PPC_FUNC(__imp__KiApcNormalRoutineNop) { StallProfiler::Scope stallProfile(StallProfiler::Section::Other, __func__, ctx.lastFunction, uint32_t(ctx.lr)); ctx.r3.u64 = 0; }
+// "Did the GPU's HSIO training succeed?" There is no Xbox GPU here: the engine's
+// D3D calls are captured and drawn by the native renderer. Returning success was
+// tried on 2026-10-25 and the title never booted: with init no longer failing,
+// the engine enters its real GPU setup and waits for ring-buffer completion
+// that nothing produces, printing "GPU is hung" from the first frame on and
+// drawing nothing. Its failure path is what lets this port run at all until
+// the ring/fence side is emulated, so failure stays the honest answer.
 PPC_FUNC(__imp__VdIsHSIOTrainingSucceeded) { StallProfiler::Scope stallProfile(StallProfiler::Section::Rendering, __func__, ctx.lastFunction, uint32_t(ctx.lr)); ctx.r3.u64 = 0; }
 PPC_FUNC(__imp__VdRetrainEDRAM) { StallProfiler::Scope stallProfile(StallProfiler::Section::Rendering, __func__, ctx.lastFunction, uint32_t(ctx.lr)); ctx.r3.u64 = 0; }
 PPC_FUNC(__imp__VdRetrainEDRAMWorker) { StallProfiler::Scope stallProfile(StallProfiler::Section::Rendering, __func__, ctx.lastFunction, uint32_t(ctx.lr)); ctx.r3.u64 = 0; }

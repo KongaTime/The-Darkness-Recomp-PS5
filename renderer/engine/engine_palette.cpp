@@ -4,7 +4,7 @@
 #include "render_trace.h"
 #include "simple_mesh.h"
 #include "ppc_recomp_shared.h"
-#include <Windows.h>
+#include "runtime/native/windows_shim.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>

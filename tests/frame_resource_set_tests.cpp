@@ -20,6 +20,13 @@ int main() {
         require(actual.size()==resources.size()+1,"Unique resource count differs");
         for(const auto& resource:resources)require(actual.contains(&resource),"Rehash lost an identity");
         const auto capacity=actual.capacity();
+        // Both most-recent identities must be forgotten at a batch boundary;
+        // this includes the case where they were inserted before a rehash.
+        actual.insert(&resources[0]);actual.insert(&resources[1]);actual.clear();
+        require(!actual.contains(&resources[0]) && !actual.contains(&resources[1]),"Recent identities survived clear");
+        require(actual.insert(&resources[1]) && actual.insert(&resources[0]),"Recent identities were not charged in the new batch");
+        for(unsigned repeat=0;repeat<1000;++repeat)
+            require(!actual.insert(&resources[repeat%2]) && actual.contains(&resources[repeat%2]),"Alternating recent membership changed");
         uint32_t random=0x3571ABCD;
         auto next=[&] {random^=random<<13;random^=random>>17;random^=random<<5;return random;};
         for(unsigned frame=0;frame<128;++frame) {

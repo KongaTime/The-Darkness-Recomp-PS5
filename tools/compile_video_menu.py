@@ -204,7 +204,7 @@ def localized_text(text, region, translations):
     return token + ", " + value
 
 
-def replace_video_page(registry, translations=None):
+def replace_video_page(registry, translations=None, platform="pc"):
     r = registry
     page, = [n for n in r.roots if r.decode(n) == ("WINDOW", "options_video")]
     # Preserve the original calibration page class, properties and navigation.
@@ -242,7 +242,10 @@ def replace_video_page(registry, translations=None):
     # The eleven native rows and original calibration controls fit above the
     # footer by starting the heading one cell earlier on the existing grid.
     properties.append(window("CubeText", "nc, §LMENU_VIDEO_HEADING", "0,1,20,2"))
-    for row, (key, name, initial) in enumerate(zip(SETTINGS, SETTING_NAMES, INITIAL_VALUES)):
+    rows = zip(SETTINGS, SETTING_NAMES, INITIAL_VALUES)
+    if platform == "ps5":
+        rows = [(key, name, initial) for key, name, initial in rows if key not in ("mode", "vsync")]
+    for row, (key, name, initial) in enumerate(rows):
         y = 3 + row + 3 * (row > 0)
         properties.append(window("CubeText", "sc, " + name, f"1,{y},10,1"))
         properties.append(window("CubeButton", "sc, < " + initial.center(12) + " >", f"11,{y},8,1", "darkrecomp." + key))
@@ -379,7 +382,7 @@ def add_pc_menu_actions(r, translations=None):
     r.root_hashes += b"\0" * (-len(r.root_hashes) % 4)
 
 
-def compile_menu(source, translations=None):
+def compile_menu(source, translations=None, platform="pc"):
     data = bytearray(source)
     assert data[:15] == b"MOS DATAFILE2.0"
     payloads = []
@@ -387,9 +390,10 @@ def compile_menu(source, translations=None):
         offset, size, version = struct.unpack_from("<III", data, entry + 32)
         assert version == 0x203
         r = Registry(data[offset:offset + size], endian)
-        replace_video_page(r, translations)
+        replace_video_page(r, translations, platform)
         add_subtitle_size(r, translations)
-        add_pc_menu_actions(r, translations)
+        if platform == "pc":
+            add_pc_menu_actions(r, translations)
         payloads.append(r.encode())
     output = data[:0x90]
     for entry, payload in zip((0x30, 0x60), payloads):
@@ -464,6 +468,7 @@ def menu_source_hashes(menu_source, archive_source):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--platform", choices=("pc", "ps5"), default="pc")
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--archive-source", type=Path)
@@ -473,13 +478,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     assert args.source.resolve() != args.output.resolve(), "Never overwrite the shipped registry"
     source = args.source.read_bytes()
-    result = compile_menu(source)
+    result = compile_menu(source, platform=args.platform)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if not args.output.exists() or args.output.read_bytes() != result:
         args.output.write_bytes(result)
     if args.russian_output:
         assert args.russian_output.resolve() not in (args.source.resolve(), args.output.resolve()), "Russian menu output must be private"
-        write_if_changed(args.russian_output, compile_menu(source, load_catalog(args.russian_catalog)))
+        write_if_changed(args.russian_output, compile_menu(source, load_catalog(args.russian_catalog), args.platform))
     if args.archive_source or args.archive_output:
         assert args.archive_source and args.archive_output
         assert args.archive_source.resolve() != args.archive_output.resolve()

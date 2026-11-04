@@ -1,8 +1,15 @@
 #include "kernel_imports.h"
+#include <cstdio>
 #include <iostream>
 #include <unordered_map>
 #include <string>
 #include <mutex>
+
+#if !defined(_WIN32)
+// MSVC's bounds-checking sprintf. Every buffer it writes here is a fixed array
+// in the same scope, so the array size is the bound.
+#define sprintf_s(buffer, ...) std::snprintf(buffer, sizeof(buffer), __VA_ARGS__)
+#endif
 
 // Weak stubs for all Xbox 360 Kernel and XAM imported functions
 // Any strong implementation in kernel_imports.cpp will automatically override these.

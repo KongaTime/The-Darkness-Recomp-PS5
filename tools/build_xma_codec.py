@@ -46,7 +46,7 @@ def verify_source_tree(source: Path, archive: Path, patched_files: dict[str, byt
         raise RuntimeError(f'Unexpected codec source files: {sorted(unexpected)}')
 
 
-def main(rebuild=False):
+def main(rebuild=False, source_only=False):
     DEPS.mkdir(parents=True, exist_ok=True)
     archive = DEPS / 'ffmpeg-darkxma-upstream.tar.gz'
     if not archive.exists():
@@ -116,6 +116,11 @@ static const AVClass darkrecomp_xma_class = {
     patch = ''.join(difflib.unified_diff(original.decode().splitlines(True), text.splitlines(True),
                                         fromfile='a/libavcodec/wmaprodec.c', tofile='b/libavcodec/wmaprodec.c'))
     (DEPS / 'ffmpeg-darkxma.patch').write_text(patch)
+    if source_only:
+        # The console build (app/ps5/tools/build-xma-codec.sh) cross-compiles this
+        # verified, patched tree itself.
+        print(source)
+        return
     build = DEPS / 'ffmpeg-darkxma-build'
     install = DEPS / 'ffmpeg-darkxma'
     build.mkdir(exist_ok=True)
@@ -163,4 +168,7 @@ static const AVClass darkrecomp_xma_class = {
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rebuild', action='store_true', help='Rebuild all codec objects for a release')
-    main(parser.parse_args().rebuild)
+    parser.add_argument('--source-only', action='store_true',
+                        help='Download, verify and patch the source, print its path and stop')
+    arguments = parser.parse_args()
+    main(arguments.rebuild, arguments.source_only)

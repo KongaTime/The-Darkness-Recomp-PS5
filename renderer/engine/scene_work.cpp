@@ -1,6 +1,6 @@
 #include "scene_work.h"
 #include "runtime/native/stall_profiler.h"
-#include <windows.h>
+#include "runtime/native/windows_shim.h"
 #include <algorithm>
 #include <bit>
 #include <cstdio>

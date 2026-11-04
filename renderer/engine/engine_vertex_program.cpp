@@ -1,10 +1,11 @@
 #include "engine_vertex_program.h"
+#include "thread_counters.h"
 #include "runtime/native/stall_profiler.h"
 #include "engine_performance.h"
 #include "simple_mesh.h"
 #include "render_trace.h"
 #include "ppc_recomp_shared.h"
-#include <Windows.h>
+#include "runtime/native/windows_shim.h"
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -14,7 +15,13 @@ namespace DarkRecomp::Native {
 namespace {
 constexpr uint32_t context = 0x82A69B00;
 std::atomic<uint64_t> attempts{0}, captured{0}, compared{0}, equal{0}, found{0}, missing{0};
-std::atomic<uint64_t> bindingAttempts{0}, bindingsCaptured{0}, descriptorsRetained{0};
+ThreadCounters<3> bindingCounts;
+void incrementBindingCounter(unsigned counter) {
+    static thread_local constinit ThreadCounters<3>::Writer writer{};
+    auto current=writer;
+    if(!current) {current=bindingCounts.acquireWriter();writer=current;}
+    current.increment(counter);
+}
 struct PreparedBinding {
     uint8_t* base = nullptr;
     EngineVertexProgramSource source;
@@ -44,7 +51,7 @@ bool initializedModes(uint8_t* base) {
     return std::memcmp(flags.data(),expected.flags.data(),flags.size())==0 &&
         std::memcmp(counts.data(),expected.counts.data(),counts.size())==0;
 }
-bool readSource(uint8_t* base, EngineVertexProgramSource& out) {
+bool readSourceCanonical(uint8_t* base, EngineVertexProgramSource& out) {
     // Each local is consumed only after its complete guarded copy succeeds.
     std::array<uint8_t, 12> selector; std::array<uint8_t, 840> state; std::array<uint8_t, 8> model;
     if (!copy(base, context + 8224, selector.data(), selector.size()) || !copy(base, context + 16420, state.data(), state.size())) return false;
@@ -69,6 +76,43 @@ bool readSource(uint8_t* base, EngineVertexProgramSource& out) {
         input.secondBlendIndices = second != 0;
     }
     out = result; return true;
+}
+bool readSource(uint8_t* base,EngineVertexProgramSource& out) {
+#if (defined(__PROSPERO__) || defined(DARK_TEST_NATIVE_CAPTURE)) && !defined(DARK_TEST_BINDING_CANONICAL)
+    if(!compactVertexSourcesEnabled.load(std::memory_order_relaxed))return readSourceCanonical(base,out);
+    std::array<uint8_t,12> selector,declaration;
+    std::array<uint8_t,4> address,material,root;
+    std::array<uint8_t,16> coordinates;
+    std::array<uint8_t,8> renderer,model;
+    if(!copy(base,context+8224,selector.data(),selector.size()) ||
+       !copy(base,context+16420,declaration.data(),declaration.size()) ||
+       !copy(base,context+16528,address.data(),address.size()) ||
+       !copy(base,context+16944,coordinates.data(),coordinates.size()) ||
+       !copy(base,context+16988,material.data(),material.size()) ||
+       !copy(base,context+17180,renderer.data(),renderer.size()) ||
+       !copy(base,context+17256,root.data(),root.size()))return false;
+    EngineVertexProgramSource result;
+    result.matrixBase=be32(selector.data());result.matrixIndex=be32(selector.data()+8);
+    const uint64_t matrix=uint64_t(result.matrixBase)+uint64_t(result.matrixIndex)*656+16;
+    if(!result.matrixBase || result.matrixIndex>=256 || (matrix&3) ||
+       !copy(base,matrix+640,model.data(),model.size()))return false;
+    result.matrixAddress=uint32_t(matrix);result.paletteAddress=be32(model.data());result.treeRoot=be32(root.data());
+    auto& input=result.input;
+    input.declarationFlags=be32(declaration.data());input.conversionMask=be32(declaration.data()+8);
+    input.declarationAddress=be32(address.data());input.materialFlags=be32(material.data());
+    input.rendererFlags=be32(renderer.data())&0x180000;input.enabledCoordinates=be32(renderer.data()+4);
+    input.modelFlags=be32(model.data()+4);input.palette=result.paletteAddress!=0;
+    std::memcpy(input.modes.data(),coordinates.data(),8);
+    std::memcpy(input.coordinateSources.data(),coordinates.data()+8,8);
+    if(input.palette) {
+        uint8_t second;
+        if(!input.declarationAddress || !copy(base,uint64_t(input.declarationAddress)+24,&second,1))return false;
+        input.secondBlendIndices=second!=0;
+    }
+    out=result;return true;
+#else
+    return readSourceCanonical(base,out);
+#endif
 }
 }
 bool buildEngineVertexProgramKey(const EngineVertexProgramInput& input, EngineVertexProgramKey& output) noexcept {
@@ -173,31 +217,103 @@ void finishEngineVertexProgramObservation(uint8_t* base, EngineVertexProgramObse
         binding.recordAddress = observation.selection.recordAddress; binding.bindingAddress = observation.selection.bindingAddress;
         binding.matrixAddress = observation.source.matrixAddress;
         preparedBinding = prepared;
-        ++descriptorsRetained;
+        incrementBindingCounter(2);
     }
 }
-static bool snapshotEngineVertexBindingsInto(uint8_t* base, EngineVertexBindingSnapshot& result) noexcept {
-    ++bindingAttempts;
-    if (!preparedBinding || preparedBinding->base != base) return false;
-    const auto& prepared = *preparedBinding;
-    auto current = [&] {
+static bool preparedBindingCurrentCanonical(uint8_t* base,const PreparedBinding& prepared) {
         EngineVertexProgramSource source;
         std::array<uint8_t,4> device, record, binding;
         // The retained key was already proved from this exact source during
         // preparation. Rebuilding it three times per draw adds no validation.
-        return readSource(base, source) && source == prepared.source &&
+        return readSourceCanonical(base, source) && source == prepared.source &&
             copy(base, context+15748, device.data(), 4) && be32(device.data()) == prepared.binding.deviceAddress &&
             copy(base, context+17188, record.data(), 4) && be32(record.data()) == prepared.binding.recordAddress &&
             copy(base, uint64_t(prepared.binding.deviceAddress)+12688, binding.data(), 4) &&
             be32(binding.data()) == prepared.binding.bindingAddress;
+}
+#if defined(__PROSPERO__) || defined(DARK_TEST_NATIVE_CAPTURE)
+static bool preparedSourceCurrent(uint8_t* base,const EngineVertexProgramSource& source) {
+    std::array<uint8_t,12> selector;
+    if(!copy(base,context+8224,selector.data(),selector.size()) ||
+       be32(selector.data())!=source.matrixBase || be32(selector.data()+8)!=source.matrixIndex)return false;
+    const auto matches=[&](uint64_t address,uint32_t expected,uint32_t mask=UINT32_MAX) {
+        std::array<uint8_t,4> bytes;
+        return copy(base,address,bytes.data(),bytes.size()) && (be32(bytes.data())&mask)==expected;
     };
+    const auto& input=source.input;
+    // Check exactly the fields readSource consumes, including its masked dirty bits.
+    if(!matches(context+16420,input.declarationFlags) || !matches(context+16428,input.conversionMask) ||
+       !matches(context+16528,input.declarationAddress) || !matches(context+16988,input.materialFlags) ||
+       !matches(context+17180,input.rendererFlags,0x180000) || !matches(context+17184,input.enabledCoordinates) ||
+       !matches(context+17256,source.treeRoot))return false;
+    std::array<uint8_t,16> coordinates;
+    std::array<uint8_t,8> model;
+    if(!copy(base,context+16944,coordinates.data(),coordinates.size()) ||
+       std::memcmp(coordinates.data(),input.modes.data(),input.modes.size()) ||
+       std::memcmp(coordinates.data()+8,input.coordinateSources.data(),input.coordinateSources.size()) ||
+       !copy(base,uint64_t(source.matrixAddress)+640,model.data(),model.size()) ||
+       be32(model.data())!=source.paletteAddress || be32(model.data()+4)!=input.modelFlags)return false;
+    if(input.palette) {
+        uint8_t second;
+        if(!copy(base,uint64_t(input.declarationAddress)+24,&second,1) ||
+           (second!=0)!=input.secondBlendIndices)return false;
+    }
+    return true;
+}
+#endif
+static bool preparedBindingCurrent(uint8_t* base,const PreparedBinding& prepared) {
+#if (defined(__PROSPERO__) || defined(DARK_TEST_NATIVE_CAPTURE)) && !defined(DARK_TEST_BINDING_CANONICAL)
+    std::array<uint8_t,4> device,record,binding;
+    if(!compactVertexSourcesEnabled.load(std::memory_order_relaxed))return preparedBindingCurrentCanonical(base,prepared);
+    return preparedSourceCurrent(base,prepared.source) &&
+        copy(base,context+15748,device.data(),4) && be32(device.data())==prepared.binding.deviceAddress &&
+        copy(base,context+17188,record.data(),4) && be32(record.data())==prepared.binding.recordAddress &&
+        copy(base,uint64_t(prepared.binding.deviceAddress)+12688,binding.data(),4) &&
+        be32(binding.data())==prepared.binding.bindingAddress;
+#else
+    return preparedBindingCurrentCanonical(base,prepared);
+#endif
+}
+#if defined(DARK_TEST_NATIVE_CAPTURE)
+bool testVertexSourceReadMatches(uint8_t* base) noexcept {
+    EngineVertexProgramSource canonical,compact;
+    const bool a=readSourceCanonical(base,canonical),b=readSource(base,compact);
+    return a==b && canonical==compact;
+}
+bool testPreparedBindingValidation(uint8_t* base,bool canonical) noexcept {
+    if(!preparedBinding || preparedBinding->base!=base)return false;
+    if(canonical)return preparedBindingCurrentCanonical(base,*preparedBinding);
+    return preparedBindingCurrent(base,*preparedBinding);
+}
+#endif
+static bool snapshotEngineVertexBindingsInto(uint8_t* base, EngineVertexBindingSnapshot& result) noexcept {
+    EngineCpuScope sample(EnginePhase::bindingCapture);
+    incrementBindingCounter(0);
+    if (!preparedBinding || preparedBinding->base != base) return false;
+    const auto& prepared = *preparedBinding;
     static_cast<EngineVertexBindingState&>(result)=prepared.binding;
     const uint64_t address = uint64_t(result.deviceAddress) + 1920;
     // Bracket the owned copy and full byte comparison with source/binding
     // checks. The comparison has the same guarded reads as the copy.
-    if (!current() || !copy(base, address, result.constantBytes.data(), result.constantBytes.size()) ||
-        !equalRenderMemory(base,address,result.constantBytes.data(),result.constantBytes.size()) || !current()) return false;
-    ++bindingsCaptured; return true;
+    if (!preparedBindingCurrent(base,prepared) || !copy(base, address, result.constantBytes.data(), result.constantBytes.size()) ||
+        !equalRenderMemory(base,address,result.constantBytes.data(),result.constantBytes.size()) || !preparedBindingCurrent(base,prepared)) return false;
+    incrementBindingCounter(1); return true;
+}
+bool withCurrentEngineVertexBinding(uint8_t* base,EngineVertexBindingConsumer consume,void* context) noexcept {
+#if defined(__PROSPERO__) || defined(DARK_TEST_NATIVE_CAPTURE)
+    if(!preparedBinding || preparedBinding->base!=base || !consume)return false;
+    const auto& prepared=*preparedBinding;
+    const uint64_t bank=uint64_t(prepared.binding.deviceAddress)+1920;
+    if(!prepared.binding.deviceAddress || bank+4096>0x100000000ull || !preparedBindingCurrent(base,prepared))return false;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const bool captured=consume(base,prepared.binding,base+bank,context);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return captured && preparedBindingCurrent(base,prepared);
+#else
+    // Native pointer consumption relies on PS5's committed mapping. Windows
+    // retains its guarded owned-bank path, including during diagnostics.
+    return false;
+#endif
 }
 bool snapshotEngineVertexBindings(uint8_t* base,EngineVertexBindingSnapshot& output) noexcept {
     EngineVertexBindingSnapshot result(EngineVertexBindingSnapshot::captureStorage());
@@ -243,14 +359,15 @@ void retainCompletedVertexBinding(uint8_t* base,uint32_t stack) noexcept {
        !copy(base,binding.recordAddress,again.data(),again.size()) || again!=record)return;
     binding.descriptor=decodeEngineVertexDescriptor(descriptor);
     binding.descriptorAddress=stack-192;binding.matrixAddress=prepared.source.matrixAddress;
-    preparedBinding=std::move(prepared);++descriptorsRetained;
+    preparedBinding=std::move(prepared);incrementBindingCounter(2);
 }
 void printEngineVertexProgramCounters() {
+    const auto bindings=bindingCounts.snapshot();
     const auto matches = equal.load(), comparisons = compared.load();
     std::fprintf(stderr, "[EngineVertexProgram] attempts=%llu captured=%llu compared=%llu bitExact=%llu different=%llu found=%llu missing=%llu (owned keys/cache selection; not native world shaders)\n",
         attempts.load(), captured.load(), comparisons, matches, comparisons - matches, found.load(), missing.load());
     std::fprintf(stderr, "[EngineVertexBindings] descriptorsRetained=%llu attempts=%llu captured=%llu (owned final descriptors/draw-time CPU constants; no world draw claim)\n",
-        descriptorsRetained.load(), bindingAttempts.load(), bindingsCaptured.load());
+        bindings[2], bindings[0], bindings[1]);
 }
 }
 extern "C" PPC_FUNC(__imp__sub_82248C80);

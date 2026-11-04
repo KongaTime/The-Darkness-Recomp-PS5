@@ -1,8 +1,10 @@
 #pragma once
 #include "engine_vertex_descriptor.h"
+#include <atomic>
 #include <optional>
 
 namespace DarkRecomp::Native {
+inline std::atomic<bool> compactVertexSourcesEnabled{true};
 using EngineVertexProgramKey = std::array<uint32_t, 6>;
 struct EngineVertexProgramInput {
     uint32_t declarationAddress = 0, declarationFlags = 0, rendererFlags = 0;
@@ -76,4 +78,10 @@ bool snapshotEngineVertexBindings(uint8_t* base, EngineVertexBindingSnapshot& ou
 // Capture directly into an unpublished draw. Failure clears the optional;
 // callers must not use it until this function has succeeded.
 bool captureEngineVertexBindings(uint8_t* base, std::optional<EngineVertexBindingSnapshot>& output) noexcept;
+// Internal synchronous capture capability. The consumer cannot retain the live
+// bank pointer: only its owned output may escape. Source/binding checks bracket
+// the callback; the consumer must independently recheck every consumed row.
+using EngineVertexBindingConsumer=bool(*)(uint8_t*,const EngineVertexBindingState&,const uint8_t*,void*) noexcept;
+bool withCurrentEngineVertexBinding(uint8_t*,EngineVertexBindingConsumer,void*) noexcept;
+
 }

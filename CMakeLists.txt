@@ -63,7 +63,8 @@ endfunction()
 add_native_menu_text(DarkRuntime)
 target_sources(DarkRuntime PRIVATE runtime/native/achievements.cpp runtime/native/achievements_catalog.cpp)
 
-target_sources(DarkRuntime PRIVATE runtime/native/fov_settings.cpp runtime/native/fov_camera.cpp)
+target_sources(DarkRuntime PRIVATE runtime/native/fov_settings.cpp runtime/native/fov_camera.cpp
+    runtime/native/camera_interpolation.cpp)
 target_sources(DarkRuntime PRIVATE runtime/native/graphics_settings.cpp runtime/native/video_settings_menu.cpp)
 target_sources(DarkRuntime PRIVATE runtime/native/mouse_look.cpp)
 target_sources(DarkRuntime PRIVATE runtime/native/menu_pointer.cpp runtime/native/keyboard_bindings.cpp)
@@ -302,6 +303,12 @@ if(BUILD_TESTING)
     add_test(NAME OriginalDisplayGammaContract COMMAND DisplayGammaTests "${CMAKE_SOURCE_DIR}/Darkness")
     add_test(NAME OriginalDisplayGammaWarpContract COMMAND DisplayGammaTests --warp)
     set_tests_properties(OriginalDisplayGammaContract OriginalDisplayGammaWarpContract PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+    # The loader's SHA-256 and AES-128, shared with the console build. The
+    # vectors are the published ones: a wrong table or rotation fails here
+    # rather than as an unsupported dump.
+    add_executable(XexCryptoPortableTests tests/xex_crypto_portable_tests.cpp)
+    target_include_directories(XexCryptoPortableTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    add_test(NAME XexCryptoPortableContract COMMAND XexCryptoPortableTests)
     add_executable(XexImageTests tests/xex_image_tests.cpp runtime/native/xex_image.cpp)
     target_include_directories(XexImageTests PRIVATE "${CMAKE_SOURCE_DIR}" "${DARK_GENERATED_DIR}")
     target_compile_definitions(XexImageTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

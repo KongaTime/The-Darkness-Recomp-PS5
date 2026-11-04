@@ -108,6 +108,48 @@ name = "ApplyGameplayFovMidAsmHook"
 address = 0x82157600
 registers = ["r31", "r29", "r30", "r21", "f1"]
 
+# These consumers use the client's integer tick (+408). Pair it with the
+# client's fractional tick (+464), rather than the predicted player phase.
+# Original loads/calls still execute; only the phase consumed afterward changes.
+[[midasm_hook]]
+name = "ApplyCameraRenderPhaseMidAsmHook"
+address = 0x82157498
+registers = ["r30", "f29"]
+
+[[midasm_hook]]
+name = "ApplyCameraRenderPhaseMidAsmHook"
+address = 0x82159F0C
+registers = ["r30", "f12"]
+
+[[midasm_hook]]
+name = "ApplyCameraRenderPhaseMidAsmHook"
+address = 0x821DCEB0
+registers = ["r27", "f1"]
+
+# The weapon obstruction/zoom path uses the same mixed clock pair.
+[[midasm_hook]]
+name = "ApplyCameraRenderPhaseMidAsmHook"
+address = 0x82165070
+registers = ["r31", "f9"]
+
+# Read-only animated head position for the opt-in PS5 camera capture.
+[[midasm_hook]]
+name = "ObserveWalkingCameraHeadMidAsmHook"
+address = 0x821DE130
+registers = ["r23", "r16", "r3", "f24", "r18"]
+
+# Read-only position after walking smoothing, before wall collision.
+[[midasm_hook]]
+name = "ObserveWalkingCameraSmoothedMidAsmHook"
+address = 0x821DE550
+registers = ["r11", "r10", "r1", "f19"]
+
+# Carry the PS5 visual history with base movement before original smoothing.
+[[midasm_hook]]
+name = "ApplyWalkingCameraMotionMidAsmHook"
+address = 0x821DE1CC
+registers = ["r23", "r16", "r18", "f24"]
+
 # Native relative mouse commands: replace only scoped mouse packet angles,
 # after client input gating but before the original zero test and enqueue.
 [[midasm_hook]]

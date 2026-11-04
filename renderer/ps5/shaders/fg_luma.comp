@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D sourceImage;
+layout(binding=1,r32f) uniform writeonly image2D outputImage;
+layout(push_constant) uniform Params {uvec4 sizes;vec4 settings;} p;
+void main() {
+    ivec2 at=ivec2(gl_GlobalInvocationID.xy),size=imageSize(outputImage);
+    if(any(greaterThanEqual(at,size)))return;
+    ivec2 limit=textureSize(sourceImage,0)-1;
+    float total=0;
+    for(int y=0;y<2;++y)for(int x=0;x<2;++x) {
+        vec3 color=texelFetch(sourceImage,min(at*2+ivec2(x,y),limit),0).rgb;
+        float value=p.sizes.z==0?dot(color,vec3(0.2126,0.7152,0.0722)):color.r;
+        total+=clamp(value,0,1);
+    }
+    imageStore(outputImage,at,vec4(total*0.25));
+}

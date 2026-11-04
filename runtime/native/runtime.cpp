@@ -10,7 +10,9 @@
 #include "language_settings.h"
 #include "native_menu_text.h"
 #include <array>
+#if defined(_WIN32)
 #include <dbghelp.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -21,8 +23,95 @@
 
 namespace DarkRecomp::Native {
 Memory* memory = nullptr;
+#if defined(_WIN32)
 thread_local PPCContext* currentContext = nullptr;
+#else
+PPCContext*& currentContextSlot() {
+    static thread_local PPCContext* context = nullptr;
+    return context;
+}
+#endif
 
+#if !defined(_WIN32)
+} // namespace DarkRecomp::Native
+// The console's direct memory: the pool a title's large allocations come from.
+// The payload SDK links these but declares none of them.
+extern "C" int32_t sceKernelReserveVirtualRange(void** address, size_t length, int flags, size_t alignment);
+extern "C" int32_t sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, size_t length,
+                                                 size_t alignment, int memoryType, int64_t* physicalStart);
+extern "C" int32_t sceKernelReleaseDirectMemory(int64_t start, size_t length);
+extern "C" int32_t sceKernelMapDirectMemory(void** address, size_t length, int protection, int flags,
+                                             int64_t directStart, size_t alignment);
+extern "C" int64_t sceKernelGetDirectMemorySize(void);
+extern "C" int32_t sceKernelMunmap(void* address, size_t length);
+namespace DarkRecomp::Native {
+namespace {
+// Clear of the window RADV reserves at 0x40_0000_0000 (see guest_memory.h).
+constexpr uint64_t kConsoleGuestBase = 0x1000000000ull;
+constexpr int kConsoleMapFixed = 0x10;
+constexpr int kConsoleProtection = 0x33; // CPU and GPU read/write
+constexpr int kConsoleDirectType = 12;
+constexpr size_t kConsoleAlignment = 2u << 20;
+}
+
+// The console has no placeholders or section views, so the guest space is
+// built from direct memory: one reserved 4 GB range, the virtual part backed
+// by its own allocation, and the physical windows mapped from one 512 MiB
+// store. A and C map it at offset 0, as on Windows, so they alias. E cannot:
+// it maps the store 4 KiB in, and the console maps direct memory in 16 KiB
+// pages, so E has its own store. Memory::allocate already keeps allocations
+// in different windows from sharing physical offsets, so only a guest that
+// reads one physical page through both E and another window would notice.
+// The guest-visible state (reserved, committed, protection) is kept by the
+// Win32 layer (win32_ps5.cpp) exactly as Windows reports it: the console
+// mapping itself is always readable and writable.
+Memory::Memory() {
+    void* reserved = reinterpret_cast<void*>(kConsoleGuestBase);
+    if (sceKernelReserveVirtualRange(&reserved, PPC_MEMORY_SIZE, kConsoleMapFixed, kConsoleAlignment) != 0)
+        throw std::runtime_error("Cannot reserve the 4 GB guest address space");
+    base_ = static_cast<uint8_t*>(reserved);
+    const int64_t pool = sceKernelGetDirectMemorySize();
+    auto back = [&](uint64_t address, uint64_t size, int64_t physical) {
+        void* at = base_ + address;
+        return sceKernelMapDirectMemory(&at, size, kConsoleProtection, kConsoleMapFixed, physical,
+                                        kConsoleAlignment) == 0 && at == base_ + address;
+    };
+    auto store = [&](uint64_t size) {
+        int64_t physical = -1;
+        if (sceKernelAllocateDirectMemory(0, pool, size, kConsoleAlignment, kConsoleDirectType, &physical) != 0)
+            throw std::runtime_error("Cannot allocate guest direct memory");
+        directMemory_.emplace_back(physical, size);
+        return physical;
+    };
+    try {
+        if (!back(0, 0xa0000000ull, store(0xa0000000ull)))
+            throw std::runtime_error("Cannot map the guest's virtual memory");
+        const int64_t physicalStore = store(0x20000000ull);
+        if (!back(0xa0000000ull, 0x20000000ull, physicalStore))
+            throw std::runtime_error("Cannot map the A physical window");
+        if (!back(0xc0000000ull, 0x20000000ull, physicalStore)) {
+            std::fputs("[Memory] The console refused a second view of the physical store; "
+                       "the C window does not alias A.\n", stderr);
+            if (!back(0xc0000000ull, 0x20000000ull, store(0x20000000ull)))
+                throw std::runtime_error("Cannot map the C physical window");
+        }
+        if (!back(0xe0000000ull, 0x20000000ull, store(0x20000000ull)))
+            throw std::runtime_error("Cannot map the E physical window");
+        win32RegisterGuestSpace(base_, PPC_MEMORY_SIZE);
+        // As on Windows: the physical windows are mapped and guarded until
+        // the allocation imports commit them.
+        DWORD previous;
+        if (!VirtualAlloc(base_ + 0xa0000000u, 0xfffff000u - 0xa0000000u, MEM_COMMIT, PAGE_READWRITE) ||
+            !VirtualProtect(base_ + 0xa0000000u, 0xfffff000u - 0xa0000000u, PAGE_NOACCESS, &previous))
+            throw std::runtime_error("Cannot guard unallocated physical memory");
+        if (!commit(0x10000, 0x0FFF0000)) throw std::runtime_error("Cannot map low guest memory");
+        if (!commit(0x10000000, 0x20000000)) throw std::runtime_error("Cannot map the title guest arena");
+    } catch (...) {
+        releaseAddressSpace();
+        throw;
+    }
+}
+#else
 Memory::Memory() {
     // One owned physical store, with the CPU aliases used by the original
     // title. A/C map offset0; E maps offset4096. This is memory, not a GPU
@@ -83,12 +172,21 @@ Memory::Memory() {
         releaseAddressSpace();throw;
     }
 }
+#endif
 Memory::~Memory() {
     stopTimestamp();
     audioDriverShutdownForMemory(this);
     releaseAddressSpace();
 }
 void Memory::releaseAddressSpace() {
+#if !defined(_WIN32)
+    if (base_) {
+        win32UnregisterGuestSpace(base_);
+        sceKernelMunmap(base_, PPC_MEMORY_SIZE);
+    }
+    for (const auto& [physical, size] : directMemory_) sceKernelReleaseDirectMemory(physical, size);
+    directMemory_.clear();
+#endif
     for(const auto& [offset,mapped]:memoryViews_) {
         if(mapped)UnmapViewOfFile(base_+offset);
         else VirtualFree(base_+offset,0,MEM_RELEASE);
@@ -497,6 +595,7 @@ void printContext(const PPCContext& ctx) {
     fputc('\n', stderr);
     fflush(stderr);
 }
+#if defined(_WIN32)
 LONG exceptionFilter(EXCEPTION_POINTERS* exception) {
     _lock_file(stderr);
     auto* record = exception->ExceptionRecord;
@@ -553,6 +652,7 @@ LONG exceptionFilter(EXCEPTION_POINTERS* exception) {
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#endif // _WIN32: the console has no structured exceptions to filter
 }
 
 [[noreturn]] void PPCRecompFailure(const PPCContext& ctx, uint32_t address, const char* reason) {

@@ -1,6 +1,6 @@
 #include "engine_transforms.h"
 #include "simple_mesh.h"
-#include <Windows.h>
+#include "runtime/native/windows_shim.h"
 #include <xmmintrin.h>
 #include <atomic>
 #include <bit>

@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D previousImage;
+layout(binding=1) uniform sampler2D currentImage;
+layout(binding=2) uniform sampler2D forwardFlow;
+layout(binding=3) uniform sampler2D backwardFlow;
+layout(binding=4,rgba32f) uniform writeonly image2D outputImage;
+layout(std430,binding=5) readonly buffer Cut {uint changed;};
+layout(push_constant) uniform Params {uvec4 sizes;vec4 settings;} p;
+bool inside(vec2 q) {return all(greaterThanEqual(q,vec2(0))) && all(lessThan(q,vec2(p.sizes.xy)));}
+vec4 flow(sampler2D field,vec2 q) {
+    vec4 f=texture(field,(q+0.5)/vec2(p.sizes.xy));f.xy*=p.settings.xy;return f;
+}
+void main() {
+    ivec2 at=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(at,imageSize(outputImage))))return;
+    vec2 q=vec2(at),extent=vec2(p.sizes.xy);
+    vec4 current=texelFetch(currentImage,at,0);
+    if(changed!=0) {imageStore(outputImage,at,current);return;}
+    float phase=p.settings.z;
+    vec2 a=q-phase*flow(forwardFlow,q).xy;
+    a=q-phase*flow(forwardFlow,a).xy;
+    vec2 b=q-(1-phase)*flow(backwardFlow,q).xy;
+    b=q-(1-phase)*flow(backwardFlow,b).xy;
+    vec4 fa=flow(forwardFlow,a),fb=flow(backwardFlow,b);
+    float ca=length(fa.xy+flow(backwardFlow,a+fa.xy).xy);
+    float cb=length(fb.xy+flow(forwardFlow,b+fb.xy).xy);
+    bool goodA=inside(a) && fa.z<0.12 && ca<max(3,0.15*length(fa.xy));
+    bool goodB=inside(b) && fb.z<0.12 && cb<max(3,0.15*length(fb.xy));
+    vec4 oldColor=texture(previousImage,(a+0.5)/extent);
+    vec4 newColor=texture(currentImage,(b+0.5)/extent);
+    vec4 result=current;
+    if(goodA && goodB) {
+        // A bad correspondence must not double the silhouette of a hand,
+        // weapon or wall. Retain the current real pixel when colors disagree.
+        if(max(max(abs(oldColor.r-newColor.r),abs(oldColor.g-newColor.g)),abs(oldColor.b-newColor.b))<0.20)
+            result=mix(oldColor,newColor,phase);
+    } else if(goodA)result=oldColor;
+    else if(goodB)result=newColor;
+    imageStore(outputImage,at,result);
+}

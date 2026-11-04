@@ -1,5 +1,6 @@
 #include "stall_profiler.h"
 #include "fov_settings.h"
+#include "camera_interpolation.h"
 #include "runtime.h"
 #include "ppc_recomp_shared.h"
 
@@ -9,6 +10,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <chrono>
+#include <filesystem>
 
 // The hooks below observe player camera construction, never the shared matrix
 // builder. Keep the portable settings/math in fov_settings.cpp independent.
@@ -258,4 +261,96 @@ void ApplyGameplayFovMidAsmHook(PPCRegister& state, PPCRegister& viewport,
     query->output = relativeGuestFovDegrees(query->original, baseline16x9, query->configured);
     if (query->output != query->original) fov.f64 = double(query->output);
     query->result = Result::adjusted;
+}
+
+// Only the four verified consumers that pair their phase with client+408.
+// Player-state interpolation, prediction and authoritative state stay original.
+void ApplyCameraRenderPhaseMidAsmHook(PPCRegister& client, PPCRegister& phase) {
+    using namespace DarkRecomp::Native;
+    if (!memory || !validSpan(client.u32, 468)) return;
+    auto* base = memory->base();
+    const ScopedMathMode mathMode;
+    float corrected = 0;
+    if (cameraRenderPhase(readWord(base, client.u32),
+                          readFloat(base, client.u32 + 464), corrected))
+        phase.f64 = double(corrected);
+}
+
+// Observe the authored head point without changing it. The actual correction
+// below carries only the previous smoothing position with base movement.
+void ObserveWalkingCameraHeadMidAsmHook(PPCRegister& client, PPCRegister& selected,
+    PPCRegister& point, PPCRegister& phase, PPCRegister& bobState) {
+#if !defined(_WIN32)
+    const ScopedMathMode mathMode;
+    auto& observation = DarkRecomp::Native::walkingCameraTrace;
+    observation.flags |= 1;
+    if (!DarkRecomp::Native::memory ||
+        !validSpan(client.u32, 468) || !validSpan(selected.u32, 424) ||
+        !validSpan(point.u32, 12) || !validSpan(bobState.u32, 9756)) {
+        observation.rejection = 2; return;
+    }
+    auto* base = DarkRecomp::Native::memory->base();
+    observation.phase = float(phase.f64);
+    observation.rootTick = readWord(base, bobState.u32 + 32);
+    observation.rootCut = readWord(base, bobState.u32 + 9752);
+    for (unsigned i = 0; i < 3; ++i)
+        observation.rawHead[i] = observation.filteredHead[i] = readFloat(base, point.u32 + 4*i);
+    const uint32_t state = readWord(base, selected.u32 + 396);
+    if (validSpan(state, 9756)) observation.selectedCut = readWord(base, state + 9752);
+#endif
+}
+
+void ObserveWalkingCameraSmoothedMidAsmHook(PPCRegister& x, PPCRegister& y,
+    PPCRegister& stack, PPCRegister& elapsed) {
+#if !defined(_WIN32)
+    const ScopedMathMode mathMode;
+    if (!DarkRecomp::Native::memory || !validSpan(stack.u32, 156)) return;
+    auto* base = DarkRecomp::Native::memory->base();
+    auto& observation = DarkRecomp::Native::walkingCameraTrace;
+    observation.flags |= 2;
+    observation.elapsed = float(elapsed.f64);
+    observation.smoothedHead = {std::bit_cast<float>(x.u32), std::bit_cast<float>(y.u32),
+        readFloat(base, stack.u32 + 152)};
+#endif
+}
+
+void ApplyWalkingCameraMotionMidAsmHook(PPCRegister& client, PPCRegister& selected,
+    PPCRegister& bobState, PPCRegister& phase) {
+#if !defined(_WIN32)
+    const ScopedMathMode mathMode;
+    using Clock = std::chrono::steady_clock;
+    static thread_local auto nextCheck = Clock::time_point{};
+    static thread_local bool enabled = true;
+    static thread_local DarkRecomp::Native::WalkingCameraMotion motion;
+    const auto now = Clock::now();
+    if (now >= nextCheck) {
+        nextCheck = now + std::chrono::seconds(1);
+        std::error_code ec;
+        enabled = !std::filesystem::exists("/download0/darkness-ps5/walking-camera.disabled", ec);
+    }
+    if (!enabled || !DarkRecomp::Native::memory || !validSpan(client.u32, 468) ||
+        !validSpan(selected.u32, 424) || !validSpan(bobState.u32, 9756)) { motion.reset(); return; }
+    auto& observation = DarkRecomp::Native::walkingCameraTrace;
+    observation.flags |= 16;
+    auto* base = DarkRecomp::Native::memory->base();
+    const uint32_t state = readWord(base, selected.u32 + 396);
+    float alpha;
+    if (!validSpan(state, 9756) || ((readWord(base, selected.u32 + 420)>>12)&15) == 3 ||
+        int32_t(readWord(base, bobState.u32+32)-readWord(base, bobState.u32+9752)) <= 3 ||
+        int32_t(readWord(base, state+32)-readWord(base, state+9752)) <= 3 ||
+        !DarkRecomp::Native::cameraRenderPhase(readWord(base, client.u32), float(phase.f64), alpha)) {
+        motion.reset(); return;
+    }
+    std::array<float,3> position{}, history{};
+    for (unsigned i = 0; i < 3; ++i) {
+        position[i] = readFloat(base, selected.u32+128+4*i);
+        history[i] = readFloat(base, bobState.u32+1864+4*i);
+    }
+    if (motion.carry(uint64_t(client.u32)<<32 | bobState.u32,
+                     readWord(base, state+32), alpha, position, history)) {
+        observation.flags |= 32;
+        for (unsigned i = 0; i < 3; ++i)
+            PPC_STORE_U32(bobState.u32+1864+4*i, std::bit_cast<uint32_t>(history[i]));
+    }
+#endif
 }

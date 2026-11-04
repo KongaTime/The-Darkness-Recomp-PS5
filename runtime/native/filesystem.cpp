@@ -97,7 +97,12 @@ PathResult resolve(uint32_t attributes) {
     } else if (lower == "\\device\\cdrom0" || lower.starts_with("\\device\\cdrom0\\")) {
         mount = memory->gameDirectory(); prefix = 14;
     } else if (lower.starts_with("cache:") || lower.starts_with("cache0:")) {
+#if defined(_WIN32)
         mount = memory->gameDirectory().parent_path() / "build_native/run/cache";
+#else
+        // The title's own folder is read-only on the console.
+        mount = std::filesystem::path(kConsoleDataRoot) / "cache";
+#endif
         prefix = lower.find(':') + 1; result.writable = true;
         std::filesystem::create_directories(mount);
     } else if (auto colon = lower.find(':'); colon != std::string::npos) {
@@ -128,6 +133,10 @@ PathResult resolve(uint32_t attributes) {
     }
     while (prefix < name.size() && name[prefix] == '\\') ++prefix;
     std::string relative = name.substr(prefix);
+#if !defined(_WIN32)
+    // The guest's separator is '\', which a POSIX path keeps as a character.
+    std::replace(relative.begin(), relative.end(), '\\', '/');
+#endif
     if (relative.find(':') != std::string::npos) { result.status = nameInvalid; return result; }
     for (const auto& component : std::filesystem::path(relative)) {
         if (component == "..") { result.status = nameInvalid; return result; }
@@ -141,20 +150,28 @@ PathResult resolve(uint32_t attributes) {
             return result;
         }
     }
+#if defined(_WIN32)
     result.path = std::filesystem::weakly_canonical(mount / relative);
+#else
+    // The disc's names are case-insensitive and the console's file system is
+    // not: match each existing component of the path ignoring case.
+    result.path = std::filesystem::weakly_canonical(win32MatchPathCase(mount, relative));
+#endif
     auto rootString = std::filesystem::weakly_canonical(mount).wstring();
     auto pathString = result.path.wstring();
     if (pathString.size() < rootString.size() || _wcsnicmp(pathString.c_str(), rootString.c_str(), rootString.size()) ||
-        (pathString.size() > rootString.size() && pathString[rootString.size()] != L'\\')) result.status = nameInvalid;
+        (pathString.size() > rootString.size() &&
+         pathString[rootString.size()] != wchar_t(std::filesystem::path::preferred_separator)))
+        result.status = nameInvalid;
     // The prepared archive preserves the user's localized strings and fonts.
     // Its menu cache either matches the generated menu or defers to the loose
     // override. Shipped (often hardlinked) assets remain untouched.
     const std::filesystem::path* replacement = nullptr;
     if (!result.status && !result.writable) {
-        const auto relativePath = result.path.lexically_relative(memory->gameDirectory()).make_preferred();
-        if (_wcsicmp(relativePath.c_str(), L"Content\\Gui\\CubeWnd.xcr") == 0)
+        const auto relativePath = result.path.lexically_relative(memory->gameDirectory()).generic_wstring();
+        if (_wcsicmp(relativePath.c_str(), L"Content/Gui/CubeWnd.xcr") == 0)
             replacement = &memory->nativeMenuAssets().menu;
-        else if (_wcsicmp(relativePath.c_str(), L"Content\\Xdf\\GameContext_Create.XDF") == 0)
+        else if (_wcsicmp(relativePath.c_str(), L"Content/Xdf/GameContext_Create.XDF") == 0)
             replacement = &memory->nativeMenuAssets().archive;
     }
     if (replacement && !replacement->empty()) {
@@ -214,7 +231,7 @@ uint32_t create(PPCContext& ctx, uint32_t out, uint32_t access, uint32_t attribu
     ioStatus(ios, status, int32_t(status) >= 0 ? uint32_t(nativeIo.Information) : 0);
     if (FileTraceEnabled() || int32_t(status) < 0)
         fprintf(stderr, "[File] open '%ls' access=0x%08X options=0x%08X status=0x%08X\n",
-                resolved.path.c_str(), access, options, status);
+                resolved.path.wstring().c_str(), access, options, status);
     return status;
 }
 }
@@ -255,7 +272,7 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile) {
         }
     }
     if (FileTraceEnabled() || int32_t(status) < 0)
-        fprintf(stderr, "[File] attributes '%ls' status=0x%08X\n", resolved.path.c_str(), status);
+        fprintf(stderr, "[File] attributes '%ls' status=0x%08X\n", resolved.path.wstring().c_str(), status);
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtReadFile) {
@@ -301,7 +318,7 @@ PPC_FUNC(__imp__NtReadFile) {
             if (!file->cachedWeaponFile->covers(uint64_t(position.QuadPart), count)) {
                 status = 0xc000003e; // STATUS_DATA_ERROR: requested bytes were not cached.
                 std::fprintf(stderr, "[Weapons] Uncached read '%ls' offset=%llu bytes=%u.\n",
-                    file->path.filename().c_str(), uint64_t(position.QuadPart), count);
+                    file->path.filename().wstring().c_str(), uint64_t(position.QuadPart), count);
             }
         }
         if (int32_t(status) < 0) {
@@ -339,7 +356,7 @@ PPC_FUNC(__imp__NtReadFile) {
     }
     if (FileTraceEnabled() || int32_t(status) < 0)
         fprintf(stderr, "[File] read '%ls' offset=0x%llX bytes=%llu status=0x%08X\n",
-                file->path.filename().c_str(), uint64_t(offset.QuadPart), uint64_t(result.Information), status);
+                file->path.filename().wstring().c_str(), uint64_t(offset.QuadPart), uint64_t(result.Information), status);
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtQueryInformationFile) {
@@ -377,7 +394,7 @@ PPC_FUNC(__imp__NtQueryInformationFile) {
     }
     if (FileTraceEnabled() || int32_t(status) < 0)
         fprintf(stderr, "[File] information '%ls' class=%u bytes=%llu status=0x%08X\n",
-                file->path.filename().c_str(), kind, uint64_t(result.Information), status);
+                file->path.filename().wstring().c_str(), kind, uint64_t(result.Information), status);
     if (int32_t(status) >= 0) {
         memset(base + out, 0, size);
         uint32_t qwords = kind == 4 ? 4 : kind == 5 ? 2 : kind == 34 ? 6 : (kind == 6 || kind == 14) ? 1 : 0;
@@ -499,11 +516,11 @@ PPC_FUNC(__imp__NtQueryDirectoryFile) {
     uint32_t written = 0;
     if (int32_t(status) >= 0) {
         uint32_t nameBytes = *reinterpret_cast<const uint32_t*>(record + 60);
-        if (nameBytes > sizeof(native) - 64 || (nameBytes & 1)) PPC_RECOMP_FAILURE(ctx, uint32_t(ctx.lr), "invalid native directory record");
+        if (nameBytes > sizeof(native) - 64 || (nameBytes % sizeof(wchar_t))) PPC_RECOMP_FAILURE(ctx, uint32_t(ctx.lr), "invalid native directory record");
         auto* name = reinterpret_cast<const wchar_t*>(record + 64);
-        int count = WideCharToMultiByte(CP_UTF8, 0, name, nameBytes / 2, nullptr, 0, nullptr, nullptr);
+        int count = WideCharToMultiByte(CP_UTF8, 0, name, nameBytes / int(sizeof(wchar_t)), nullptr, 0, nullptr, nullptr);
         std::string utf8(count, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, name, nameBytes / 2, utf8.data(), count, nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, name, nameBytes / int(sizeof(wchar_t)), utf8.data(), count, nullptr, nullptr);
         written = 64 + (std::min)(length - 64, uint32_t(utf8.size()));
         memset(base + out, 0, written);
         memory->write32(out + 4, *reinterpret_cast<const uint32_t*>(record + 4));
@@ -516,12 +533,12 @@ PPC_FUNC(__imp__NtQueryDirectoryFile) {
             if (record == native) file->pendingDirectoryEntry.assign(native, native + 64 + nameBytes);
         } else file->pendingDirectoryEntry.clear();
         if (FileTraceEnabled() || int32_t(status) < 0)
-            fprintf(stderr, "[File] directory '%ls': %s\n", file->path.c_str(), utf8.c_str());
+            fprintf(stderr, "[File] directory '%ls': %s\n", file->path.wstring().c_str(), utf8.c_str());
     }
     ioStatus(ios, status, written);
     if (FileTraceEnabled() || int32_t(status) < 0)
         fprintf(stderr, "[File] directory query '%ls' filter='%ls' class=1 restart=%u length=%u status=0x%08X completed=%u\n",
-                file->path.c_str(), pattern.c_str(), unsigned(restart), length, status, unsigned(completed));
+                file->path.wstring().c_str(), pattern.c_str(), unsigned(restart), length, status, unsigned(completed));
     if (completed) {
         if (ctx.r5.u32 & ~1u) queueGuestApc(ctx, ctx.r5.u32, ctx.r6.u32, ios);
         if (event) SetEvent(event->handle);
@@ -583,7 +600,7 @@ PPC_FUNC(__imp__NtWriteFile) {
     }
     if (FileTraceEnabled() || int32_t(status) < 0)
         fprintf(stderr, "[File] write '%ls' offset=0x%llX bytes=%llu status=0x%08X\n",
-                file->path.filename().c_str(), uint64_t(offset.QuadPart), uint64_t(result.Information), status);
+                file->path.filename().wstring().c_str(), uint64_t(offset.QuadPart), uint64_t(result.Information), status);
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtFlushBuffersFile) {
@@ -599,6 +616,6 @@ PPC_FUNC(__imp__NtFlushBuffersFile) {
     uint32_t status = uint32_t(nt<Flush>(ctx, "NtFlushBuffersFile")(file->handle, &result));
     ioStatus(ios, status, 0);
     if (FileTraceEnabled() || int32_t(status) < 0)
-        fprintf(stderr, "[File] flush '%ls' status=0x%08X\n", file->path.filename().c_str(), status);
+        fprintf(stderr, "[File] flush '%ls' status=0x%08X\n", file->path.filename().wstring().c_str(), status);
     ctx.r3.u64 = status;
 }

@@ -1,4 +1,5 @@
 #include "stored_geometry.h"
+#include "engine_performance.h"
 #include "runtime/native/stall_profiler.h"
 #include "simple_mesh.h"
 #include <algorithm>
@@ -279,19 +280,22 @@ bool StoredGeometryCache::finish(StoredUpload&& upload, uint8_t* base) noexcept 
     } catch (...) { return false; }
 }
 
-StoredDraw StoredGeometryCache::draw(uint8_t* base, uint32_t vertexId, uint32_t indexId,
+template<bool SingleLock>
+StoredDraw StoredGeometryCache::drawWithLockPolicy(uint8_t* base, uint32_t vertexId, uint32_t indexId,
                                      uint32_t firstIndex, uint32_t indexCount, uint32_t boundIndexBuffer) noexcept {
-    // Phase 1: snapshot owned geometry under the lock. Guest validation below
-    // performs a dozen SEH-guarded guest reads; holding the lock across them
-    // would serialize any concurrent hook on memory latency.
+    EngineCpuScope sample(EnginePhase::geometryResolve);
+    // Snapshot owned geometry under the lock. Windows releases it for guarded
+    // guest validation; PS5's committed mapping allows one bounded critical
+    // section, as in upstream's native draw path. Both use the same validator.
     std::shared_ptr<const StoredGeometry> vertices, indices;
     uint32_t vertexAddress = 0, indexAddress = 0;
     uint64_t vertexGeneration = 0, indexGeneration = 0;
     const void* vertexEntry = nullptr;
     const void* indexEntry = nullptr;
     bool combined = false;
+    std::unique_lock lock(mutex_,std::defer_lock);
     try {
-        std::lock_guard lock(mutex_);
+        lock.lock();
         auto* v=vertexId<byId_.size()?byId_[vertexId]:nullptr;
         auto* i=indexId<byId_.size()?byId_[indexId]:nullptr;
         if (!v || !i) { ++stats_.missingDraws; return {}; }
@@ -299,9 +303,10 @@ StoredDraw StoredGeometryCache::draw(uint8_t* base, uint32_t vertexId, uint32_t 
         vertexAddress = vertices->address; indexAddress = indices->address;
         vertexGeneration = generations_[vertexId]; indexGeneration = generations_[indexId];
         vertexEntry = v; indexEntry = i; combined = (v == i);
+        if constexpr(!SingleLock)lock.unlock();
     } catch (...) { return {}; }
-    // Phase 2: lock-free validation against the snapshots. Owned vectors stay
-    // alive through the snapshot references even if evicted concurrently.
+    // Owned vectors stay alive through the snapshot references even if the
+    // two-lock policy allows concurrent eviction during guest validation.
     enum class Verdict { kMatch, kMissing, kInvalid };
     Verdict verdict = Verdict::kMatch;
     try {
@@ -329,10 +334,10 @@ StoredDraw StoredGeometryCache::draw(uint8_t* base, uint32_t vertexId, uint32_t 
             }
         }
     } catch (...) { return {}; }
-    // Phase 3: confirm neither entry was replaced during validation, then
-    // publish LRU/statistics. A replacement is a safe miss, never stale data.
+    // Recheck identity/generation before publishing LRU/statistics. For the
+    // one-lock policy the cache has remained stable throughout validation.
     try {
-        std::lock_guard lock(mutex_);
+        if constexpr(!SingleLock)lock.lock();
         auto* v=vertexId<byId_.size()?byId_[vertexId]:nullptr;
         auto* i=indexId<byId_.size()?byId_[indexId]:nullptr;
         if (!v || !i || v != vertexEntry || i != indexEntry ||
@@ -346,6 +351,24 @@ StoredDraw StoredGeometryCache::draw(uint8_t* base, uint32_t vertexId, uint32_t 
         return {std::move(vertices), std::move(indices), firstIndex, indexCount};
     } catch (...) { return {}; }
 }
+StoredDraw StoredGeometryCache::draw(uint8_t* base,uint32_t vertexId,uint32_t indexId,
+    uint32_t firstIndex,uint32_t indexCount,uint32_t boundIndexBuffer) noexcept {
+#if defined(__PROSPERO__)
+    // Guest reads are bounded loads in a committed mapping on PS5. Keep the
+    // cache stable throughout validation, avoiding a second mutex acquisition.
+    return drawWithLockPolicy<true>(base,vertexId,indexId,firstIndex,indexCount,boundIndexBuffer);
+#else
+    // Windows guest reads may fault/page in; retain lock-free guest validation.
+    return drawWithLockPolicy<false>(base,vertexId,indexId,firstIndex,indexCount,boundIndexBuffer);
+#endif
+}
+#if defined(DARK_TEST_STORED_LOCK)
+StoredDraw StoredGeometryCache::testDrawWithLockPolicy(bool single,uint8_t* base,uint32_t vertexId,uint32_t indexId,
+    uint32_t firstIndex,uint32_t indexCount,uint32_t boundIndexBuffer) noexcept {
+    return single?drawWithLockPolicy<true>(base,vertexId,indexId,firstIndex,indexCount,boundIndexBuffer):
+        drawWithLockPolicy<false>(base,vertexId,indexId,firstIndex,indexCount,boundIndexBuffer);
+}
+#endif
 std::shared_ptr<const StoredGeometry> StoredGeometryCache::vertexStream(uint8_t* base,uint32_t id,uint32_t bound) noexcept {
     std::shared_ptr<const StoredGeometry> geometry;
     uint32_t address = 0;

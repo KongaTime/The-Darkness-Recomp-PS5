@@ -1,6 +1,93 @@
 ﻿#include "host_filesystem.h"
+#include <iostream>
+#include <unordered_map>
+#include <filesystem>
+#include <vector>
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <cerrno>
+#include <cctype>
+#if defined(_WIN32)
 #include <windows.h>
 #include <dbghelp.h>
+#else
+#include "host_filesystem_posix.h"
+#include <mutex>
+#include <cstdint>
+#include "runtime/guest/guest_types.h"
+// PS5: the MSVC byteswap intrinsics and SEH the code below uses.
+#define _byteswap_ulong(x) __builtin_bswap32(x)
+#define _byteswap_ushort(x) __builtin_bswap16(x)
+#define _byteswap_uint64(x) __builtin_bswap64(x)
+#define __try if (true)
+#define __except(x) if (false)
+#define EXCEPTION_EXECUTE_HANDLER 1
+#define DWORD uint32_t
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+#define ERROR_HANDLE_EOF 38
+#define FILE_BEGIN 0
+#define FILE_CURRENT 1
+struct OVERLAPPED { uint32_t Offset; uint32_t OffsetHigh; };
+struct LARGE_INTEGER { int64_t QuadPart; };
+#define GetLastError() (errno)
+#define CRITICAL_SECTION int
+#include <sys/stat.h>
+#include <unistd.h>
+struct WIN32_FILE_ATTRIBUTE_DATA { uint32_t dwFileAttributes; uint32_t nFileSizeHigh; uint32_t nFileSizeLow; };
+#define GetFileExInfoStandard 0
+// PS5: Win32 file calls mapped onto the POSIX fd helpers in host_filesystem_posix.h.
+inline int ReadFile(int fd, void* buf, uint32_t len, uint32_t* read, OVERLAPPED* ov) {
+    uint64_t off = ov ? (((uint64_t)ov->OffsetHigh << 32) | ov->Offset) : DarkRecomp::PosixFile::Tell(fd);
+    int64_t n = DarkRecomp::PosixFile::ReadAt(fd, buf, len, off);
+    if (n < 0) { *read = 0; return 0; }
+    *read = (uint32_t)n;
+    if (!ov) DarkRecomp::PosixFile::Seek(fd, off + (uint64_t)n);
+    return 1;
+}
+inline int WriteFile(int fd, const void* buf, uint32_t len, uint32_t* written, OVERLAPPED* ov) {
+    uint64_t off = ov ? (((uint64_t)ov->OffsetHigh << 32) | ov->Offset) : DarkRecomp::PosixFile::Tell(fd);
+    int64_t n = DarkRecomp::PosixFile::WriteAt(fd, buf, len, off);
+    if (n < 0) { *written = 0; return 0; }
+    *written = (uint32_t)n;
+    if (!ov) DarkRecomp::PosixFile::Seek(fd, off + (uint64_t)n);
+    return 1;
+}
+inline int CloseHandle(int fd) { DarkRecomp::PosixFile::Close(fd); return 1; }
+inline int FlushFileBuffers(int fd) { return fsync(fd) == 0; }
+inline int SetFilePointerEx(int fd, LARGE_INTEGER pos, LARGE_INTEGER* out, uint32_t) {
+    DarkRecomp::PosixFile::Seek(fd, (uint64_t)pos.QuadPart);
+    if (out) out->QuadPart = (int64_t)pos.QuadPart;
+    return 1;
+}
+inline int GetFileSizeEx(int fd, LARGE_INTEGER* sz) { sz->QuadPart = (int64_t)DarkRecomp::PosixFile::Size(fd); return 1; }
+inline int GetFileAttributesExA(const char* path, int, WIN32_FILE_ATTRIBUTE_DATA* fad) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    uint64_t size = S_ISDIR(st.st_mode) ? 0 : (uint64_t)st.st_size;
+    fad->dwFileAttributes = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
+    fad->nFileSizeHigh = (uint32_t)(size >> 32);
+    fad->nFileSizeLow = (uint32_t)size;
+    return 1;
+}
+#define GENERIC_READ 0x80000000u
+#define GENERIC_WRITE 0x40000000u
+#define OPEN_ALWAYS 4
+#define OPEN_EXISTING 3
+#define CREATE_ALWAYS 2
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <cerrno>
+#include <cctype>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 #include <iostream>
 #include <unordered_map>
 #include <filesystem>
@@ -11,19 +98,36 @@
 
 namespace DarkRecomp {
 
+#if defined(_WIN32)
+using FileHandle = HANDLE;
+constexpr FileHandle kInvalidFile = INVALID_HANDLE_VALUE;
+#else
+using FileHandle = int;
+constexpr FileHandle kInvalidFile = -1;
+#endif
+
 struct HostFile {
-    HANDLE hFile;
+    FileHandle hFile;
     uint64_t fileSize;
     std::string path;
 };
 
 static std::unordered_map<uint32_t, HostFile> g_openFiles;
 static uint32_t g_nextHandle = 0x1000;
+#if defined(_WIN32)
 static CRITICAL_SECTION g_fsLock;
+#else
+// PS5: the Win32 critical-section calls below map onto a recursive mutex.
+static std::recursive_mutex g_fsLockImpl;
+#define InitializeCriticalSection(cs) ((void)0)
+#define EnterCriticalSection(cs) g_fsLockImpl.lock()
+#define LeaveCriticalSection(cs) g_fsLockImpl.unlock()
+#define g_fsLock g_fsLockImpl
+#endif
 
 void InitializeFileSystem() {
     InitializeCriticalSection(&g_fsLock);
-    std::cout << "[FS] Initialized native Xbox 360 File System Bridge." << std::endl;
+    std::cerr << "[FS] Initialized native Xbox 360 File System Bridge." << std::endl;
 }
 
 static std::string DecodeGuestUnicodeString(uint32_t bufferPtr, uint16_t byteLen, uint8_t* base) {
@@ -104,6 +208,46 @@ static std::string ExtractGuestPath(uint32_t objectAttributesPtr, uint8_t* base)
     return "";
 }
 
+// Where the game's files are. Relative to the working directory unless the
+// title says otherwise: the console starts a title in /, not in its own folder.
+static std::filesystem::path g_gameDirectory = "Darkness";
+
+// Finds root/relative with each component matched without regard to case.
+static bool FindIgnoringCase(const std::filesystem::path& root, const std::string& relative,
+                             std::filesystem::path& found) {
+    auto lower = [](std::string text) {
+        for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return text;
+    };
+    std::filesystem::path current = root;
+    size_t start = 0;
+    while (start <= relative.size()) {
+        size_t end = relative.find('/', start);
+        if (end == std::string::npos) end = relative.size();
+        const std::string component = relative.substr(start, end - start);
+        start = end + 1;
+        if (component.empty() || component == ".") continue;
+        std::error_code ec;
+        if (std::filesystem::exists(current / component, ec)) {
+            current /= component;
+            continue;
+        }
+        const std::string wanted = lower(component);
+        bool matched = false;
+        for (std::filesystem::directory_iterator it(current, ec), last; !ec && it != last; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (lower(name) == wanted) {
+                current /= name;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return false;
+    }
+    found = current;
+    return true;
+}
+
 static std::string ResolveGuestPath(const std::string& raw) {
     std::string p = raw;
     // Normalize separators first so prefix matching is stable.
@@ -144,23 +288,42 @@ static std::string ResolveGuestPath(const std::string& raw) {
         p.erase(0, 1);
     }
 
-    // Try candidates in Darkness directory
-    std::vector<std::filesystem::path> candidates = {
-        std::filesystem::path("Darkness") / p,
-        std::filesystem::path("Darkness/Content") / p,
-        std::filesystem::path("Darkness/Content_Eng") / p,
-        std::filesystem::path(p)
+    // Try candidates in the game directory, as spelled and then ignoring case:
+    // the guest's names are the disc's case-insensitive ones, and the
+    // console's file system is case-sensitive.
+    const std::filesystem::path roots[] = {
+        g_gameDirectory,
+        g_gameDirectory / "Content",
+        g_gameDirectory / "Content_Eng",
     };
-
-    for (const auto& c : candidates) {
+    for (const auto& root : roots) {
         std::error_code ec;
-        if (std::filesystem::exists(c, ec)) {
-            return c.string();
+        if (std::filesystem::exists(root / p, ec)) {
+            return (root / p).string();
+        }
+    }
+    for (const auto& root : roots) {
+        std::filesystem::path found;
+        if (FindIgnoringCase(root, p, found)) {
+            return found.string();
         }
     }
 
+    // A read of a file that is not there is what the guest reports as a
+    // dirty disc, so name it (the first few) for the console's log.
+    static int missingLogged = 0;
+    if (missingLogged < 32) {
+        ++missingLogged;
+        std::fprintf(stderr, "[FS] not found: %s (guest %s)\n", p.c_str(), raw.c_str());
+        std::fflush(stderr);
+    }
+
     // Return default target even if not yet created (for write/open)
-    return (std::filesystem::path("Darkness") / p).string();
+    return (g_gameDirectory / p).string();
+}
+
+void SetGameDirectory(const std::filesystem::path& directory) {
+    g_gameDirectory = directory;
 }
 
 void Hook_NtOpenFile(PPCContext& ctx, uint8_t* base) {
@@ -182,7 +345,7 @@ void Hook_NtOpenFile(PPCContext& ctx, uint8_t* base) {
             uint32_t root = _byteswap_ulong(*reinterpret_cast<uint32_t*>(pA + 4));
             uint32_t nameP = _byteswap_ulong(*reinterpret_cast<uint32_t*>(pA + 8));
             uint32_t attr = _byteswap_ulong(*reinterpret_cast<uint32_t*>(pA + 12));
-            std::cout << "[FS] NtOpenFile empty path diag: pAttr=0x" << std::hex << pAttr
+            std::cerr << "[FS] NtOpenFile empty path diag: pAttr=0x" << std::hex << pAttr
                       << " Len=0x" << lenA << " Root=0x" << root << " NamePtr=0x" << nameP
                       << " Attr=0x" << attr
                       << " | regs r3=0x" << ctx.r3.u32 << " r4=0x" << ctx.r4.u32
@@ -192,25 +355,26 @@ void Hook_NtOpenFile(PPCContext& ctx, uint8_t* base) {
                       << " | mem:";
             for (int i = 0; i < 8; i++) {
                 uint32_t w = _byteswap_ulong(*reinterpret_cast<uint32_t*>(pA + i * 4));
-                char tmp[16]; sprintf_s(tmp, " [%d]=0x%x", i, w);
-                std::cout << tmp;
+                char tmp[16]; snprintf(tmp, sizeof(tmp), " [%d]=0x%x", i, w);
+                std::cerr << tmp;
             }
             if (nameP) {
                 uint8_t* pN = base + nameP;
                 uint16_t ulen = _byteswap_ushort(*reinterpret_cast<uint16_t*>(pN + 0));
                 uint16_t umax = _byteswap_ushort(*reinterpret_cast<uint16_t*>(pN + 2));
                 uint32_t ubuf = _byteswap_ulong(*reinterpret_cast<uint32_t*>(pN + 4));
-                std::cout << " ULen=" << std::dec << ulen << " UMax=" << umax
+                std::cerr << " ULen=" << std::dec << ulen << " UMax=" << umax
                           << " UBuf=0x" << std::hex << ubuf;
                 if (ubuf) {
-                    std::cout << " UBytes:";
+                    std::cerr << " UBytes:";
                     for (int i = 0; i < 16; i++) {
-                        char tmp[8]; sprintf_s(tmp, " %02X", (base + ubuf)[i]);
-                        std::cout << tmp;
+                        char tmp[8]; snprintf(tmp, sizeof(tmp), " %02X", (base + ubuf)[i]);
+                        std::cerr << tmp;
                     }
                 }
             }
-            std::cout << std::dec << std::endl;
+            std::cerr << std::dec << std::endl;
+#if defined(_WIN32)
             // First empty-path call: dump host stack once to identify the PPC
             // caller (which wrapper builds this struct layout).
             {
@@ -230,7 +394,7 @@ void Hook_NtOpenFile(PPCContext& ctx, uint8_t* base) {
                     sf.AddrFrame.Mode = AddrModeFlat;
                     sf.AddrStack.Offset = hc.Rsp;
                     sf.AddrStack.Mode = AddrModeFlat;
-                    std::cout << "[FS] NtOpenFile caller stack:" << std::endl;
+                    std::cerr << "[FS] NtOpenFile caller stack:" << std::endl;
                     for (int frame = 0; frame < 10; frame++) {
                         if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, hProcess, hThread, &sf, &hc,
                                          nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
@@ -243,20 +407,22 @@ void Hook_NtOpenFile(PPCContext& ctx, uint8_t* base) {
                         DWORD64 disp = 0;
                         std::string nm;
                         if (SymFromAddr(hProcess, sf.AddrPC.Offset, &disp, pSym)) nm = pSym->Name;
-                        else { char tmp[32]; sprintf_s(tmp, "0x%llX", sf.AddrPC.Offset); nm = tmp; }
-                        std::cout << "   [F#" << frame << "] " << nm << "+0x" << std::hex << disp << std::dec << std::endl;
+                        else { char tmp[32]; snprintf(tmp, sizeof(tmp), "0x%llX", (unsigned long long)sf.AddrPC.Offset); nm = tmp; }
+                        std::cerr << "   [F#" << frame << "] " << nm << "+0x" << std::hex << disp << std::dec << std::endl;
                     }
-                    std::cout.flush();
+                    std::cerr.flush();
                 }
             }
+#endif
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            std::cout << "[FS] NtOpenFile empty path diag: exception reading guest structs" << std::endl;
+            std::cerr << "[FS] NtOpenFile empty path diag: exception reading guest structs" << std::endl;
         }
     }
 
     DWORD desiredAccess = GENERIC_READ;
     if (access & 0x0002) desiredAccess |= GENERIC_WRITE;
 
+#if defined(_WIN32)
     HANDLE h = CreateFileA(
         resolved.c_str(),
         desiredAccess,
@@ -266,9 +432,12 @@ void Hook_NtOpenFile(PPCContext& ctx, uint8_t* base) {
         FILE_ATTRIBUTE_NORMAL,
         nullptr
     );
+#else
+    FileHandle h = PosixFile::Open(resolved, (access & 0x0002) != 0, 1);
+#endif
 
-    if (h == INVALID_HANDLE_VALUE) {
-        std::cout << "[FS] NtOpenFile FAILED: \"" << rawPath << "\" -> \"" << resolved << "\"" << std::endl;
+    if (h == kInvalidFile) {
+        std::cerr << "[FS] NtOpenFile FAILED: \"" << rawPath << "\" -> \"" << resolved << "\"" << std::endl;
         if (pStatus) {
             *reinterpret_cast<uint32_t*>(base + pStatus + 0) = _byteswap_ulong(0xC0000034); // STATUS_OBJECT_NAME_NOT_FOUND
             *reinterpret_cast<uint32_t*>(base + pStatus + 4) = 0;
@@ -277,16 +446,22 @@ void Hook_NtOpenFile(PPCContext& ctx, uint8_t* base) {
         return;
     }
 
+    uint64_t fileSize = 0;
+#if defined(_WIN32)
     LARGE_INTEGER sz;
     GetFileSizeEx(h, &sz);
+    fileSize = (uint64_t)sz.QuadPart;
+#else
+    fileSize = PosixFile::Size(h);
+#endif
 
     EnterCriticalSection(&g_fsLock);
     uint32_t guestHandle = g_nextHandle++;
-    g_openFiles[guestHandle] = { h, (uint64_t)sz.QuadPart, resolved };
+    g_openFiles[guestHandle] = { h, fileSize, resolved };
     LeaveCriticalSection(&g_fsLock);
 
-    std::cout << "[FS] NtOpenFile: \"" << rawPath << "\" -> \"" << resolved << "\" (Handle=0x" 
-              << std::hex << guestHandle << ", Size=" << std::dec << sz.QuadPart << " bytes)" << std::endl;
+    std::cerr << "[FS] NtOpenFile: \"" << rawPath << "\" -> \"" << resolved << "\" (Handle=0x"
+              << std::hex << guestHandle << ", Size=" << std::dec << fileSize << " bytes)" << std::endl;
 
     if (pHandle) {
         *reinterpret_cast<uint32_t*>(base + pHandle) = _byteswap_ulong(guestHandle);
@@ -315,6 +490,7 @@ void Hook_NtCreateFile(PPCContext& ctx, uint8_t* base) {
     DWORD desiredAccess = GENERIC_READ;
     if (access & 0x0002) desiredAccess |= GENERIC_WRITE;
 
+#if defined(_WIN32)
     HANDLE h = CreateFileA(
         resolved.c_str(),
         desiredAccess,
@@ -324,9 +500,12 @@ void Hook_NtCreateFile(PPCContext& ctx, uint8_t* base) {
         FILE_ATTRIBUTE_NORMAL,
         nullptr
     );
+#else
+    FileHandle h = PosixFile::Open(resolved, (access & 0x0002) != 0, disposition);
+#endif
 
-    if (h == INVALID_HANDLE_VALUE) {
-        std::cout << "[FS] NtCreateFile FAILED: \"" << rawPath << "\" -> \"" << resolved << "\"" << std::endl;
+    if (h == kInvalidFile) {
+        std::cerr << "[FS] NtCreateFile FAILED: \"" << rawPath << "\" -> \"" << resolved << "\"" << std::endl;
         if (pStatus) {
             *reinterpret_cast<uint32_t*>(base + pStatus + 0) = _byteswap_ulong(0xC0000034);
             *reinterpret_cast<uint32_t*>(base + pStatus + 4) = 0;
@@ -335,16 +514,22 @@ void Hook_NtCreateFile(PPCContext& ctx, uint8_t* base) {
         return;
     }
 
+    uint64_t fileSize = 0;
+#if defined(_WIN32)
     LARGE_INTEGER sz;
     GetFileSizeEx(h, &sz);
+    fileSize = (uint64_t)sz.QuadPart;
+#else
+    fileSize = PosixFile::Size(h);
+#endif
 
     EnterCriticalSection(&g_fsLock);
     uint32_t guestHandle = g_nextHandle++;
-    g_openFiles[guestHandle] = { h, (uint64_t)sz.QuadPart, resolved };
+    g_openFiles[guestHandle] = { h, fileSize, resolved };
     LeaveCriticalSection(&g_fsLock);
 
-    std::cout << "[FS] NtCreateFile: \"" << rawPath << "\" -> \"" << resolved << "\" (Handle=0x"
-              << std::hex << guestHandle << ", Size=" << std::dec << sz.QuadPart << " bytes)" << std::endl;
+    std::cerr << "[FS] NtCreateFile: \"" << rawPath << "\" -> \"" << resolved << "\" (Handle=0x"
+              << std::hex << guestHandle << ", Size=" << std::dec << fileSize << " bytes)" << std::endl;
 
     if (pHandle) {
         *reinterpret_cast<uint32_t*>(base + pHandle) = _byteswap_ulong(guestHandle);
@@ -380,6 +565,7 @@ void Hook_NtReadFile(PPCContext& ctx, uint8_t* base) {
     DWORD bytesRead = 0;
     BOOL ok = FALSE;
 
+#if defined(_WIN32)
     if (pOffset != 0) {
         uint64_t offset = _byteswap_uint64(*reinterpret_cast<uint64_t*>(base + pOffset));
         OVERLAPPED ov = {};
@@ -389,6 +575,47 @@ void Hook_NtReadFile(PPCContext& ctx, uint8_t* base) {
     } else {
         ok = ReadFile(file.hFile, base + pBuffer, length, &bytesRead, nullptr);
     }
+#else
+    // PS5: positioned read. Without an offset, or with NT's "use the file
+    // pointer" offset (-2; any negative one), the guest reads at the file's
+    // current position, which the handle tracks on this side.
+    const int64_t requested = pOffset != 0
+        ? static_cast<int64_t>(_byteswap_uint64(*reinterpret_cast<uint64_t*>(base + pOffset)))
+        : -2;
+    const bool atPointer = requested < 0;
+    const uint64_t offset = atPointer ? PosixFile::Tell(file.hFile) : static_cast<uint64_t>(requested);
+    const int64_t got = PosixFile::ReadAt(file.hFile, base + pBuffer, length, offset);
+    if (got < 0) {
+        // Report the failure instead of an empty success: a loader reading a
+        // count from a failed read loops on whatever was in its buffer.
+        const int error = errno;
+        static int failuresLogged = 0;
+        if (failuresLogged < 32) {
+            ++failuresLogged;
+            std::fprintf(stderr, "[FS] read failed: \"%s\" offset=%llu len=%u errno=%d\n", file.path.c_str(),
+                         static_cast<unsigned long long>(offset), length, error);
+        }
+        if (pStatus) {
+            *reinterpret_cast<uint32_t*>(base + pStatus + 0) = _byteswap_ulong(0xC0000185); // STATUS_IO_DEVICE_ERROR
+            *reinterpret_cast<uint32_t*>(base + pStatus + 4) = 0;
+        }
+        ctx.r3.u64 = 0xC0000185;
+        return;
+    }
+    bytesRead = static_cast<DWORD>(got);
+    if (atPointer) PosixFile::Seek(file.hFile, offset + bytesRead);
+    if (bytesRead == 0 && length != 0) {
+        // NtReadFile at or past the end of the file: STATUS_END_OF_FILE, which
+        // is how the guest's readers stop.
+        if (pStatus) {
+            *reinterpret_cast<uint32_t*>(base + pStatus + 0) = _byteswap_ulong(0xC0000011);
+            *reinterpret_cast<uint32_t*>(base + pStatus + 4) = 0;
+        }
+        ctx.r3.u64 = 0xC0000011;
+        return;
+    }
+    ok = TRUE;
+#endif
 
     if (!ok && bytesRead == 0) {
         DWORD err = GetLastError();
@@ -420,10 +647,10 @@ void Hook_NtReadFile(PPCContext& ctx, uint8_t* base) {
             auto it2 = g_openFiles.find(handle);
             if (it2 != g_openFiles.end()) nm = it2->second.path;
             LeaveCriticalSection(&g_fsLock);
-            std::cout << "[FS] NtReadFile # " << s_readLogged << " handle=0x" << std::hex << handle
+            std::cerr << "[FS] NtReadFile # " << s_readLogged << " handle=0x" << std::hex << handle
                       << " guestBuf=0x" << pBuffer << std::dec << " len=" << length
                       << " got=" << bytesRead << " \"" << nm << "\"" << std::endl;
-            std::cout.flush();
+            std::cerr.flush();
         }
     }
     ctx.r3.u64 = 0;
@@ -546,19 +773,27 @@ void Hook_NtSetInformationFile(PPCContext& ctx, uint8_t* base) {
     HostFile file = it->second;
     LeaveCriticalSection(&g_fsLock);
 
-    // Class 4: FilePositionInformation
-    if (infoClass == 4 && length >= 8 && pInfo) {
+    // Class 14: FilePositionInformation (NT's numbering; 4 is the basic
+    // information, which carries no position).
+    uint32_t status = 0;
+    if (infoClass == 14 && length >= 8 && pInfo) {
         uint64_t newPos = _byteswap_uint64(*reinterpret_cast<uint64_t*>(base + pInfo));
         LARGE_INTEGER li;
         li.QuadPart = newPos;
         SetFilePointerEx(file.hFile, li, nullptr, FILE_BEGIN);
+    } else if (infoClass != 13 && infoClass != 19 && infoClass != 20) {
+        // 13 (disposition), 19 (allocation) and 20 (end of file) are the save
+        // path's; they have no effect on the read-only game folder.
+        status = 0xC0000003; // STATUS_INVALID_INFO_CLASS
+        std::fprintf(stderr, "[FS] set information class %u not supported (\"%s\")\n", infoClass,
+                     file.path.c_str());
     }
 
     if (pStatus) {
-        *reinterpret_cast<uint32_t*>(base + pStatus + 0) = 0;
+        *reinterpret_cast<uint32_t*>(base + pStatus + 0) = _byteswap_ulong(status);
         *reinterpret_cast<uint32_t*>(base + pStatus + 4) = 0;
     }
-    ctx.r3.u64 = 0;
+    ctx.r3.u64 = status;
 }
 
 void Hook_NtQueryInformationFile(PPCContext& ctx, uint8_t* base) {
@@ -578,34 +813,73 @@ void Hook_NtQueryInformationFile(PPCContext& ctx, uint8_t* base) {
     HostFile file = it->second;
     LeaveCriticalSection(&g_fsLock);
 
-    uint32_t written = 0;
+    // NT's information classes, with the layouts runtime/native/filesystem.cpp
+    // writes. This bridge used to answer 4 as the position (4 is the basic
+    // information; the position is 14) and every other class with an empty
+    // success, so a reader asking for the size read whatever was in its buffer.
+    LARGE_INTEGER sz;
+    GetFileSizeEx(file.hFile, &sz);
+    const uint64_t size = static_cast<uint64_t>(sz.QuadPart);
+#if defined(_WIN32)
+    LARGE_INTEGER zero = {}, cur = {};
+    SetFilePointerEx(file.hFile, zero, &cur, FILE_CURRENT);
+    const uint64_t position = static_cast<uint64_t>(cur.QuadPart);
+#else
+    const uint64_t position = PosixFile::Tell(file.hFile);
+#endif
+    constexpr uint32_t kNormal = 0x80; // FILE_ATTRIBUTE_NORMAL
+    uint8_t* out = pInfo ? base + pInfo : nullptr;
+    auto put64 = [&](uint32_t offset, uint64_t value) {
+        *reinterpret_cast<uint64_t*>(out + offset) = _byteswap_uint64(value);
+    };
+    auto put32 = [&](uint32_t offset, uint32_t value) {
+        *reinterpret_cast<uint32_t*>(out + offset) = _byteswap_ulong(value);
+    };
 
-    // Class 4: FilePositionInformation
-    if (infoClass == 4 && pInfo && length >= 8) {
-        LARGE_INTEGER zero = {}, cur = {};
-        SetFilePointerEx(file.hFile, zero, &cur, FILE_CURRENT);
-        *reinterpret_cast<uint64_t*>(base + pInfo) = _byteswap_uint64(cur.QuadPart);
-        written = 8;
+    uint32_t needed = 0;
+    switch (infoClass) {
+        case 4: needed = 40; break;  // FileBasicInformation
+        case 5: needed = 24; break;  // FileStandardInformation
+        case 6: needed = 8; break;   // FileInternalInformation
+        case 14: needed = 8; break;  // FilePositionInformation
+        case 16: needed = 4; break;  // FileModeInformation
+        case 17: needed = 4; break;  // FileAlignmentInformation
+        case 34: needed = 56; break; // FileNetworkOpenInformation
+        default: break;
     }
-    // Class 5: FileStandardInformation
-    else if (infoClass == 5 && pInfo && length >= 24) {
-        LARGE_INTEGER sz;
-        GetFileSizeEx(file.hFile, &sz);
-        uint8_t* out = base + pInfo;
-        memset(out, 0, 24);
-        *reinterpret_cast<uint64_t*>(out + 0) = _byteswap_uint64(sz.QuadPart); // AllocationSize
-        *reinterpret_cast<uint64_t*>(out + 8) = _byteswap_uint64(sz.QuadPart); // EndOfFile
-        *reinterpret_cast<uint32_t*>(out + 16) = _byteswap_ulong(1); // NumberOfLinks
-        out[20] = 0; // DeletePending
-        out[21] = 0; // Directory
-        written = 24;
+    uint32_t status = 0;
+    if (needed == 0) {
+        status = 0xC0000003; // STATUS_INVALID_INFO_CLASS
+        std::fprintf(stderr, "[FS] query information class %u not supported (\"%s\")\n", infoClass,
+                     file.path.c_str());
+    } else if (!out || length < needed) {
+        status = 0xC0000004; // STATUS_INFO_LENGTH_MISMATCH
+    } else {
+        memset(out, 0, needed);
+        switch (infoClass) {
+            case 4: put32(32, kNormal); break;
+            case 5:
+                put64(0, size); // AllocationSize
+                put64(8, size); // EndOfFile
+                put32(16, 1);   // NumberOfLinks
+                break;
+            case 6: put64(0, handle); break;
+            case 14: put64(0, position); break;
+            case 16: break;
+            case 17: break;
+            case 34:
+                put64(32, size); // AllocationSize
+                put64(40, size); // EndOfFile
+                put32(48, kNormal);
+                break;
+        }
     }
 
     if (pStatus) {
-        *reinterpret_cast<uint32_t*>(base + pStatus + 0) = 0;
-        *reinterpret_cast<uint32_t*>(base + pStatus + 4) = _byteswap_ulong(written);
+        *reinterpret_cast<uint32_t*>(base + pStatus + 0) = _byteswap_ulong(status);
+        *reinterpret_cast<uint32_t*>(base + pStatus + 4) = _byteswap_ulong(status == 0 ? needed : 0);
     }
-    ctx.r3.u64 = 0;
+    ctx.r3.u64 = status;
 }
 
 void Hook_NtQueryFullAttributesFile(PPCContext& ctx, uint8_t* base) {

@@ -58,6 +58,26 @@ uint32_t observeFrontend(uint8_t* base, uint32_t frontend, bool afterUpdate = fa
     if (!memory || base != memory->base() || !frontend ||
         uint64_t(frontend) + 1036 > PPC_MEMORY_SIZE) return 0;
     std::lock_guard ownershipLock(pointerOwnershipMutex);
+#if !defined(_WIN32)
+    if (afterUpdate && PPC_LOAD_U32(frontend) == 0x82071A10) {
+        const int32_t depth = int32_t(PPC_LOAD_U32(frontend + 464));
+        if (depth >= 0 && depth < 10) {
+            const uint32_t data = PPC_LOAD_U32(frontend + 384 + uint32_t(depth) * 8 + 4);
+            if (data && uint64_t(data) + 130 <= PPC_MEMORY_SIZE && !(PPC_LOAD_U16(data) & 0x8000)) {
+                const char* name = reinterpret_cast<const char*>(base + data + 2);
+                const size_t size = strnlen_s(name, 128);
+                static std::string last;
+                static unsigned reports = 0;
+                if (size < 128 && last != std::string_view(name, size) && reports < 64) {
+                    last.assign(name, size);
+                    ++reports;
+                    std::fprintf(stderr, "[MenuFlow] menu=%s depth=%d frontend=%08X root=%08X\n",
+                                 last.c_str(), depth, frontend, PPC_LOAD_U32(frontend + 16));
+                }
+            }
+        }
+    }
+#endif
     const auto root = PPC_LOAD_U32(frontend + 16);
     const bool hasControls = menuPointerTreeHasControl(base, root);
     // SCRIPT_CREATE runs before the new root is assigned. Publish only after

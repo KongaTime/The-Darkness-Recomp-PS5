@@ -1,6 +1,5 @@
 #include "xex_image.h"
-#include <Windows.h>
-#include <bcrypt.h>
+#include "xex_crypto_portable.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -20,45 +19,16 @@ uint32_t be32(std::span<const uint8_t> b, size_t p) {
     require(p <= b.size() && b.size() - p >= 4, "Truncated XEX field");
     return uint32_t(b[p]) << 24 | uint32_t(b[p+1]) << 16 | uint32_t(b[p+2]) << 8 | b[p+3];
 }
+// The loader's two cryptographic steps, shared with the console build: bcrypt
+// is not on the console, and a second implementation would have to be proven
+// against the same dumps a second time.
 std::string digest(std::span<const uint8_t> bytes) {
-    BCRYPT_ALG_HANDLE provider = nullptr;
-    require(BCryptOpenAlgorithmProvider(&provider, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0,
-            "SHA256 provider unavailable");
-    std::array<uint8_t, 32> hash{};
-    const auto status = BCryptHash(provider, nullptr, 0, const_cast<PUCHAR>(bytes.data()),
-                                  ULONG(bytes.size()), hash.data(), ULONG(hash.size()));
-    BCryptCloseAlgorithmProvider(provider, 0);
-    require(status >= 0, "Cannot verify game image hash");
-    constexpr char hex[] = "0123456789abcdef";
-    std::string result(64, '0');
-    for (size_t i = 0; i < hash.size(); ++i) {
-        result[i * 2] = hex[hash[i] >> 4];
-        result[i * 2 + 1] = hex[hash[i] & 15];
-    }
-    return result;
+    require(!bytes.empty(), "Cannot verify an empty game image hash");
+    return XexCrypto::Sha256Hex(bytes);
 }
 void decrypt(std::vector<uint8_t>& bytes, std::span<const uint8_t, 16> key) {
     require(!bytes.empty() && bytes.size() % 16 == 0, "Invalid encrypted XEX length");
-    struct Handles {
-        BCRYPT_ALG_HANDLE algorithm = nullptr;
-        BCRYPT_KEY_HANDLE key = nullptr;
-        ~Handles() {
-            if (key) BCryptDestroyKey(key);
-            if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-        }
-    } handles;
-    require(BCryptOpenAlgorithmProvider(&handles.algorithm, BCRYPT_AES_ALGORITHM, nullptr, 0) >= 0,
-            "AES provider unavailable");
-    require(BCryptSetProperty(handles.algorithm, BCRYPT_CHAINING_MODE,
-            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
-            sizeof(BCRYPT_CHAIN_MODE_CBC), 0) >= 0, "Cannot configure XEX AES");
-    require(BCryptGenerateSymmetricKey(handles.algorithm, &handles.key, nullptr, 0,
-            const_cast<PUCHAR>(key.data()), ULONG(key.size()), 0) >= 0, "Cannot initialize XEX AES");
-    std::array<uint8_t, 16> iv{};
-    ULONG written = 0;
-    require(BCryptDecrypt(handles.key, bytes.data(), ULONG(bytes.size()), nullptr,
-            iv.data(), ULONG(iv.size()), bytes.data(), ULONG(bytes.size()), &written, 0) >= 0 &&
-            written == bytes.size(), "Cannot decrypt XEX image");
+    XexCrypto::DecryptCbc(bytes, key);
 }
 }
 
@@ -95,7 +65,10 @@ XexImage decodeXex(std::span<const uint8_t> bytes) {
         std::vector<uint8_t> session(header.begin() + security + 0x150, header.begin() + security + 0x160);
         decrypt(session, retailKey);
         decrypt(payload, std::span<const uint8_t, 16>(session.data(), 16));
-        SecureZeroMemory(session.data(), session.size());
+        // The decrypted session key is key material: clear it without letting
+        // the compiler drop the write.
+        volatile uint8_t* scratch = session.data();
+        for (size_t i = 0; i < session.size(); ++i) scratch[i] = 0;
     }
     XexImage result{{header.begin(), header.end()}, std::vector<uint8_t>(imageSize)};
     if (!compression) {

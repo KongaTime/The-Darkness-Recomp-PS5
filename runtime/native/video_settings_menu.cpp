@@ -73,8 +73,12 @@ bool changeVideoSetting(std::string_view action, int direction) noexcept {
     if (action == "darkrecomp.bloom") settings.bloom = !settings.bloom;
     else if (action == "darkrecomp.motionblur") settings.motionBlur = !settings.motionBlur;
     else if (action == "darkrecomp.antialiasing")
+#ifdef _WIN32
         settings.antialiasing = AntialiasingMode(step(unsigned(settings.antialiasing), direction,
             std::array{0u, 1u, 2u, 3u, 4u, 5u}));
+#else
+        settings.antialiasing = settings.antialiasing == AntialiasingMode::Off ? AntialiasingMode::FXAA : AntialiasingMode::Off;
+#endif
     else if (action == "darkrecomp.anisotropy")
         settings.anisotropyLevels = step(settings.anisotropyLevels, direction, std::array{1u, 2u, 4u, 8u, 16u});
     else if (action == "darkrecomp.brightness")
@@ -87,7 +91,11 @@ bool changeVideoSetting(std::string_view action, int direction) noexcept {
     else if (action == "darkrecomp.resolution")
         settings.renderHeight = step(settings.renderHeight, direction, std::array{360u, 480u, 720u, 1080u, 1440u, 2160u});
     else if (action == "darkrecomp.fps")
+#ifdef _WIN32
         settings.frameRateLimit = step(settings.frameRateLimit, direction, std::array{0u, 30u, 60u, 90u, 120u, 144u, 165u, 240u, 360u});
+#else
+        settings.frameRateLimit = step(settings.frameRateLimit, direction, std::array{0u, 30u, 60u});
+#endif
     else if (action == "darkrecomp.fov") {
         const auto value = fieldOfViewSetting();
         const float next = direction > 0 ? (value == 0 ? 60.f : value >= 120 ? 0.f : std::floor(value) + 1.f)

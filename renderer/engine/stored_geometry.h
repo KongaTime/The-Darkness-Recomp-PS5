@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace DarkRecomp::Native {
@@ -32,7 +33,37 @@ struct StoredDraw {
     uint32_t firstIndex = 0, indexCount = 0;
     std::optional<EngineTransformSnapshot> transforms;
     std::optional<EngineVertexBindingSnapshot> vertexBindings;
+    StoredDraw() = default;
+    StoredDraw(std::shared_ptr<const StoredGeometry> v, std::shared_ptr<const StoredGeometry> i,
+               uint32_t first, uint32_t count) noexcept
+        : vertices(std::move(v)), indices(std::move(i)), firstIndex(first), indexCount(count) {}
+    // std::optional of a trivially copyable snapshot copies its whole backing
+    // storage even when empty. Most cache results have no snapshots yet; copy
+    // only engaged values while keeping the same ownership and moved-from state.
+    StoredDraw(const StoredDraw& other) : vertices(other.vertices), indices(other.indices),
+        firstIndex(other.firstIndex), indexCount(other.indexCount) {copySnapshots(other);}
+    StoredDraw(StoredDraw&& other) noexcept : vertices(std::move(other.vertices)), indices(std::move(other.indices)),
+        firstIndex(other.firstIndex), indexCount(other.indexCount) {copySnapshots(other);}
+    StoredDraw& operator=(const StoredDraw& other) {
+        if (this != &other) {
+            vertices=other.vertices; indices=other.indices;
+            firstIndex=other.firstIndex; indexCount=other.indexCount; copySnapshots(other);
+        }
+        return *this;
+    }
+    StoredDraw& operator=(StoredDraw&& other) noexcept {
+        if (this != &other) {
+            vertices=std::move(other.vertices); indices=std::move(other.indices);
+            firstIndex=other.firstIndex; indexCount=other.indexCount; copySnapshots(other);
+        }
+        return *this;
+    }
     explicit operator bool() const { return vertices && indices; }
+private:
+    void copySnapshots(const StoredDraw& other) noexcept {
+        if (other.transforms) transforms.emplace(*other.transforms); else transforms.reset();
+        if (other.vertexBindings) vertexBindings.emplace(*other.vertexBindings); else vertexBindings.reset();
+    }
 };
 struct StoredGeometryStats {
     uint64_t started = 0, published = 0, rejectedUploads = 0, evicted = 0;
@@ -64,7 +95,11 @@ public:
                     uint32_t firstIndex, uint32_t indexCount, uint32_t boundIndexBuffer) noexcept;
     std::shared_ptr<const StoredGeometry> vertexStream(uint8_t* base,uint32_t vertexId,uint32_t boundVertexBuffer) noexcept;
     StoredGeometryStats stats() const;
+#if defined(DARK_TEST_STORED_LOCK)
+    StoredDraw testDrawWithLockPolicy(bool single,uint8_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t) noexcept;
+#endif
 private:
+    template<bool SingleLock> StoredDraw drawWithLockPolicy(uint8_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t) noexcept;
     struct Entry { std::shared_ptr<const StoredGeometry> geometry; uint64_t used; };
     using Entries=std::unordered_map<uint32_t,Entry>;
     Entries::iterator eraseEntry(Entries::iterator);
@@ -78,8 +113,9 @@ private:
     // uploads 6,000+ resources before drawing. The mutex stays exclusive: all
     // callers are engine-thread hooks (render_trace/simple_mesh interception),
     // so a shared_mutex would only pessimize the uncontended path. Concurrency
-    // safety instead comes from this index plus generation-rechecked,
-    // lock-free guest validation in draw()/vertexStream().
+    // safety comes from this index and generation checks. Windows draw() and
+    // vertexStream() release the lock for guest validation; PS5 draw() keeps
+    // one critical section across bounded reads in its committed guest mapping.
     std::unordered_multimap<uint32_t, uint32_t> byAddress_;
     std::vector<uint64_t> generations_;
     uint64_t clock_ = 0;

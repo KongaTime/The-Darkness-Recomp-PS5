@@ -1,5 +1,5 @@
 #pragma once
-#include <windows.h>
+#include "windows_shim.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 #include "ppc_context.h"
+#include "atomic_shared_ptr.h"
+#include "guest_context.h"
 #include "native_menu_assets.h"
 #include "developer_weapon_assets.h"
 
@@ -83,9 +85,14 @@ private:
     void forgetThreadStorage(uint32_t address, uint32_t size);
     uint8_t* base_ = nullptr;
     std::vector<std::pair<uint32_t, bool>> memoryViews_;
+#if !defined(_WIN32)
+    // The console's direct-memory ranges behind the guest space, released
+    // with it.
+    std::vector<std::pair<int64_t, uint64_t>> directMemory_;
+#endif
     std::filesystem::path gameDir_;
     NativeMenuAssets nativeMenuAssets_;
-    std::atomic<std::shared_ptr<const DeveloperWeaponAssets>> developerWeaponAssets_;
+    AtomicSharedPtr<const DeveloperWeaponAssets> developerWeaponAssets_;
     uint32_t headerSize_ = 0;
     std::vector<uint8_t> tlsInitial_;
     std::map<uint32_t, uint32_t> allocations_;
@@ -101,7 +108,6 @@ private:
     bool timestampArmed_ = false;
 };
 extern Memory* memory;
-extern thread_local PPCContext* currentContext;
 // Host teardown unwinds a blocked guest callback without returning guest success.
 struct DispatcherCancellation { bool requested = false; }; // guarded by dispatcher mutex
 struct DispatcherWaitCancelled {};

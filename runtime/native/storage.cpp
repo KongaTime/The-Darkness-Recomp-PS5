@@ -1,6 +1,7 @@
 #include "stall_profiler_lock.h"
 #include "stall_profiler.h"
 #include "storage.h"
+#include "storage_path_status.h"
 #include "runtime.h"
 #include <algorithm>
 #include <atomic>
@@ -40,7 +41,7 @@ bool reservedAlias(const std::string& lower) {
 bool insideRoot(const std::wstring& rootCanon, const std::wstring& dirCanon) {
     if (dirCanon.size() <= rootCanon.size()) return false;
     if (_wcsnicmp(dirCanon.c_str(), rootCanon.c_str(), rootCanon.size()) != 0) return false;
-    return dirCanon[rootCanon.size()] == L'\\';
+    return dirCanon[rootCanon.size()] == wchar_t(std::filesystem::path::preferred_separator);
 }
 
 bool containedDirLocked(const std::filesystem::path& root, const std::filesystem::path& dir,
@@ -65,7 +66,7 @@ bool confinedMetaLocked(const std::filesystem::path& canonicalDir, const std::fi
     std::filesystem::path filePath = dir / fileName;
     // An absent path is the expected creation case, not an error; only genuine
     // filesystem errors or an actual reparse point reject the target.
-    bool isLink = std::filesystem::is_symlink(filePath, ec);
+    bool isLink = StorageDetail::isSymlink(filePath, ec);
     if (ec && ec != std::errc::no_such_file_or_directory) return false;
     if (isLink) return false;
     std::filesystem::path fileCanon = std::filesystem::weakly_canonical(filePath, ec);
@@ -157,6 +158,11 @@ std::filesystem::path ContentDir(const ContentInfo& content) {
 }
 
 bool WriteContentMeta(const std::filesystem::path& dir, const ContentInfo& content) {
+    const auto failed = [&](const char* step) {
+        std::fprintf(stderr, "[NativeStorage] metadata %s failed path=%s winerror=%u errno=%d\n",
+                     step, dir.string().c_str(), unsigned(GetLastError()), errno);
+        return false;
+    };
     StallProfiler::Scope profile(StallProfiler::Section::FileIO, "Storage::WriteContentMeta",
         currentContext ? currentContext->lastFunction : 0, currentContext ? uint32_t(currentContext->lr) : 0);
     std::filesystem::path root;
@@ -166,9 +172,9 @@ bool WriteContentMeta(const std::filesystem::path& dir, const ContentInfo& conte
         else if (memory && !memory->gameDirectory().empty()) root = memory->gameDirectory().parent_path() / "saves";
     }
     std::filesystem::path canonicalDir;
-    if (!containedDirLocked(root, dir, &canonicalDir)) return false;
+    if (!containedDirLocked(root, dir, &canonicalDir)) return failed("container containment");
     std::error_code ec;
-    if (!std::filesystem::is_directory(dir, ec) || ec) return false;
+    if (!std::filesystem::is_directory(dir, ec) || ec) return failed("container directory");
     // Serialize the payload first so the file write is a single checked span.
     std::string blob;
     blob.append("XCS1", 4);
@@ -198,10 +204,10 @@ bool WriteContentMeta(const std::filesystem::path& dir, const ContentInfo& conte
                  static_cast<unsigned long>(n));
         std::filesystem::path candidate = dir / name;
         std::error_code linkEc;
-        bool isLink = std::filesystem::is_symlink(candidate, linkEc);
-        if (linkEc && linkEc != std::errc::no_such_file_or_directory) return false;
-        if (isLink) return false;
-        if (!confinedMetaLocked(canonicalDir, dir, name)) return false;
+        bool isLink = StorageDetail::isSymlink(candidate, linkEc);
+        if (linkEc && linkEc != std::errc::no_such_file_or_directory) return failed("temp status");
+        if (isLink) return failed("temp symlink");
+        if (!confinedMetaLocked(canonicalDir, dir, name)) return failed("temp containment");
         handle = CreateFileW(candidate.wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
         if (handle != INVALID_HANDLE_VALUE) {
@@ -209,18 +215,22 @@ bool WriteContentMeta(const std::filesystem::path& dir, const ContentInfo& conte
             break;
         }
         DWORD createError = GetLastError();
-        if (createError != ERROR_ALREADY_EXISTS && createError != ERROR_FILE_EXISTS) return false;
+        if (createError != ERROR_ALREADY_EXISTS && createError != ERROR_FILE_EXISTS) return failed("temp open");
     }
-    if (handle == INVALID_HANDLE_VALUE) return false;
+    if (handle == INVALID_HANDLE_VALUE) return failed("temp name exhaustion");
     DWORD written = 0;
     bool wrote = WriteFile(handle, blob.data(), static_cast<DWORD>(blob.size()), &written, nullptr) &&
-                 written == blob.size() && FlushFileBuffers(handle);
+                 written == blob.size();
+    if (!wrote) failed("write");
+    const bool flushed = wrote && FlushFileBuffers(handle);
+    if (wrote && !flushed) failed("flush");
     BOOL closed = CloseHandle(handle);
-    if (!wrote || !closed) {
+    if (!flushed || !closed) {
         std::filesystem::remove(tmp, ec);
         return false;
     }
     if (!confinedMetaLocked(canonicalDir, dir, "_xcontent.meta")) {
+        failed("destination containment");
         std::filesystem::remove(tmp, ec);
         return false;
     }
@@ -229,6 +239,7 @@ bool WriteContentMeta(const std::filesystem::path& dir, const ContentInfo& conte
     std::filesystem::path metaPath = dir / "_xcontent.meta";
     if (!MoveFileExW(tmp.wstring().c_str(), metaPath.wstring().c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        failed("rename");
         std::filesystem::remove(tmp, ec);
         return false;
     }
@@ -333,7 +344,7 @@ uint32_t EnumerateChecked(uint32_t contentType, std::vector<ContentInfo>& out) {
     for (const auto& entry : it) {
         if (ec) break;
         std::error_code entryEc;
-        if (entry.is_symlink(entryEc) || entryEc) continue;
+        if (StorageDetail::isSymlink(entry.path(), entryEc) || entryEc) continue;
         if (!entry.is_directory(entryEc) || entryEc) continue;
         std::string name = entry.path().filename().string();
         if (name.size() <= 9 || name.compare(0, 9, want) != 0) continue;
@@ -430,7 +441,7 @@ uint32_t CreateContent(std::string_view rootAlias, const ContentInfo& content, u
         std::filesystem::path canonicalDir;
         if (!containedDirLocked(root, dir, &canonicalDir)) return 0x57;
         std::error_code dirEc;
-        if (std::filesystem::is_symlink(dir, dirEc) || dirEc) return 0x57;
+        if (StorageDetail::isSymlink(dir, dirEc) || dirEc) return 0x57;
         if (mode == 3 || mode == 4) {
             ContentInfo meta;
             if (!ReadContentMeta(dir, meta) || meta.fileName != content.fileName ||
@@ -471,7 +482,10 @@ uint32_t CreateContent(std::string_view rootAlias, const ContentInfo& content, u
         // containment check just failed.
         std::error_code createEc;
         bool weCreated = std::filesystem::create_directory(dir, createEc);
-        if (createEc) return 0x05;
+        if (createEc) {
+            std::fprintf(stderr, "[NativeStorage] mkdir %s failed: %s\n", dir.string().c_str(), createEc.message().c_str());
+            return 0x05;
+        }
         if (!weCreated) return 0xB7;
         if (!containedDirLocked(root, dir, nullptr)) return 0x57;
         if (!WriteContentMeta(dir, content)) {
@@ -485,7 +499,7 @@ uint32_t CreateContent(std::string_view rootAlias, const ContentInfo& content, u
             return 0x05;
         }
         std::fprintf(stderr, "[NativeStorage] Created content '%s' type=0x%08X at '%ls'\n",
-                     content.fileName.c_str(), content.contentType, dir.c_str());
+                     content.fileName.c_str(), content.contentType, dir.wstring().c_str());
     } else if (mode == 2 || mode == 5) {
         if (!clearContainer(dir)) return 0x05;
         if (!WriteContentMeta(dir, content)) return 0x05;
@@ -499,7 +513,7 @@ uint32_t CreateContent(std::string_view rootAlias, const ContentInfo& content, u
     if (outDisposition) *outDisposition = disposition;
     if (outPath) *outPath = dir;
     std::fprintf(stderr, "[NativeStorage] Mount '%.*s' -> '%ls' disp=%u\n",
-                 int(rootAlias.size()), rootAlias.data(), dir.c_str(), disposition);
+                 int(rootAlias.size()), rootAlias.data(), dir.wstring().c_str(), disposition);
     return 0;
 }
 
@@ -579,7 +593,7 @@ uint32_t DeleteContent(const ContentInfo& content) {
     std::filesystem::path canonicalDir;
     if (!containedDirLocked(root, dir, &canonicalDir)) return 0x57;
     std::error_code ec;
-    if (std::filesystem::is_symlink(dir, ec) || ec) return 0x57;
+    if (StorageDetail::isSymlink(dir, ec) || ec) return 0x57;
     if (!std::filesystem::exists(canonicalDir, ec) || ec) return 0x02;
     {
         std::lock_guard lock(mutex);

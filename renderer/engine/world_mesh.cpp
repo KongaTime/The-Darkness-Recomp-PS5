@@ -1,7 +1,14 @@
 #include "world_mesh.h"
+#include "vertex_constant_ranges.h"
+#include "thread_counters.h"
+#include "queued_world_draw.h"
 #include "engine_performance.h"
 #include "scene_work.h"
 #include "engine_world_fragment_bindings.generated.h"
+#include "shader_lookup.h"
+#if defined(__PROSPERO__)
+#include "draw_control_allocator.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -11,7 +18,9 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#include <intrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h> // __cpuid, for the SSSE3 feature probe below
+#endif
 #include <tmmintrin.h>
 #include <mutex>
 #include <utility>
@@ -21,13 +30,20 @@ namespace DarkRecomp::Native {
 namespace {
 constexpr uint32_t context = 0x82A69B00;
 constexpr std::array<uint8_t,27> sizes{0,4,8,12,16,2,4,6,8,2,4,6,8,6,4,4,4,4,4,4,2,4,8,2,4,6,8};
-std::atomic<uint64_t> observed{}, captured{}, rejected{}, submitted[5]{};
+ThreadCounters<8> worldCounts;
+auto worldCounterWriter() {
+    static thread_local constinit ThreadCounters<8>::Writer writer{};
+    auto current=writer;
+    if(!current) {current=worldCounts.acquireWriter();writer=current;}
+    return current;
+}
+void incrementWorldCounter(unsigned counter) {worldCounterWriter().increment(counter);}
 std::atomic<uint64_t> immediateCanonicalRecovered{}, immediateCanonicalRefused{};
 std::atomic<uint64_t> immediateCanonicalRecoveredTex1371{}, immediateCanonicalRecoveredTex1477{};
 std::atomic<unsigned> immediateCanonicalLog1371{}, immediateCanonicalLog1477{};
 uint32_t word(const uint8_t* p) { return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3]; }
 uint16_t half(const uint8_t* p) { return uint16_t(uint16_t(p[0])<<8 | p[1]); }
-unsigned worldDescriptorKeyMismatch(const EngineVertexBindingSnapshot& binding) noexcept {
+unsigned worldDescriptorKeyMismatch(const EngineVertexBindingState& binding) noexcept {
     const auto& d=binding.descriptor;
     // Only encoded descriptor bytes0..19 belong to key1..5. Compare these
     // exact words in order, without encoding the unused descriptor tail.
@@ -76,7 +92,14 @@ __attribute__((target("ssse3"))) bool copyFiniteVectorsSimd(const uint8_t* sourc
     return true;
 }
 bool copyFiniteVectors(const uint8_t* source,EngineVector* output,unsigned count) {
+#if defined(_MSC_VER)
     static const bool ssse3=[] {int cpu[4]{};__cpuid(cpu,1);return (cpu[2]&(1<<9))!=0;}();
+#else
+    // The host CPU check is a Windows concern. The console compiles this target
+    // with -mssse3 (its CPU is baseline SSSE3), so the vector path is always the
+    // one the Windows build takes on a capable machine.
+    constexpr bool ssse3=true;
+#endif
     if(ssse3)return copyFiniteVectorsSimd(source,output,count);
     for(unsigned i=0;i<count;++i) {
         for(unsigned lane=0;lane<4;++lane)output[i][lane]=std::bit_cast<float>(word(source+i*16+lane*4));
@@ -84,8 +107,8 @@ bool copyFiniteVectors(const uint8_t* source,EngineVector* output,unsigned count
     }
     return true;
 }
-// Reuse draw objects and their fragment-name capacity. Shared_ptr control
-// blocks still use their normal allocator. Small per-thread reserves transfer
+// Reuse draw objects and their fragment-name capacity. The PS5 also pools
+// shared_ptr control storage. Small per-thread reserves transfer
 // empty objects in batches, avoiding a shared lock on every capture/release.
 // Resource references and partial banks are cleared before recycling. The
 // releasing thread prepares the next capture without extending engine work.
@@ -153,7 +176,25 @@ void resetPartialWorldDraw(WorldDraw* raw) noexcept {
     // publishing an empty object to the pool, after its last owner retires.
     // Normal queued draws retire on the rendering thread; rejected captures
     // follow the same reset path on their producer.
-    std::memset(raw->constants.vectors.data(), 0, sizeof(raw->constants.vectors));
+    const auto& mask=raw->constants.written;
+    size_t cleared=0;
+    if(QueuedWorldDrawAccess::owned(*raw) && selectiveWorldDrawReset.load(std::memory_order_relaxed) &&
+       selectiveWorldDrawResetSafe.load(std::memory_order_relaxed) && (mask[0]|mask[1]|mask[2]|mask[3])) {
+        for(unsigned word=0;word<mask.size();++word) {
+            auto bits=mask[word];
+            while(bits) {
+                const unsigned first=std::countr_zero(bits),count=std::countr_one(bits>>first);
+                std::memset(raw->constants.vectors.data()+word*64+first,0,count*sizeof(EngineVector));
+                cleared+=count*sizeof(EngineVector);
+                if(first+count==64)break;
+                bits&=~((uint64_t(1)<<(first+count))-1);
+            }
+        }
+        if(cleared<sizeof(raw->constants.vectors))
+            worldVertexResetBytesSaved.fetch_add(sizeof(raw->constants.vectors)-cleared,std::memory_order_relaxed);
+    } else std::memset(raw->constants.vectors.data(), 0, sizeof(raw->constants.vectors));
+    QueuedWorldDrawAccess::recycled(*raw);
+    raw->constants.written = {};
     std::memset(raw->fragmentConstants.data(), 0, sizeof(raw->fragmentConstants));
     std::memset(raw->textureObjects.data(), 0, sizeof(raw->textureObjects));
     raw->textureIds.fill(0);
@@ -181,6 +222,7 @@ void recycleWorldDraw(WorldDraw* raw) noexcept {
     delete raw;
 }
 std::shared_ptr<WorldDraw> acquireWorldDraw() {
+    EngineCpuScope sample(EnginePhase::drawAllocation);
     WorldDraw* raw = nullptr;
     if(auto* local=localWorldDrawPool())raw=local->take();
     else {
@@ -192,7 +234,11 @@ std::shared_ptr<WorldDraw> acquireWorldDraw() {
         raw = new WorldDraw();
         resetPartialWorldDraw(raw);
     }
+#if defined(__PROSPERO__)
+    return std::shared_ptr<WorldDraw>(raw,recycleWorldDraw,DrawControlAllocator<std::byte>{});
+#else
     return std::shared_ptr<WorldDraw>(raw, recycleWorldDraw);
+#endif
 }
 // Task-59 private failure detail: mirror decodeWorldVertices' format walk to
 // locate the first nonfinite lane without changing the decoder itself. Only
@@ -373,6 +419,46 @@ bool validateWorldVertices(const StoredGeometry& g) noexcept {
     });
 }
 
+// One vertex slot, decoded exactly as the full walk below decodes it. The
+// palette proof needs only the four influence streams of the vertices a draw
+// actually indexes; decoding those, rather than every vertex of a shared
+// resource, is what keeps a skinned draw's capture off the frame's critical
+// path. Returns false for a non-finite value, like the full walk.
+static bool decodeWorldSlot(const uint8_t* p,uint8_t f,EngineVector& v) noexcept {
+    v={0,0,0,1};
+    if(!f)return true; // The implicit (0,0,0,1) stream is already finite.
+    if (f<=4) { for (unsigned n=0;n<f;++n) v[n]=std::bit_cast<float>(word(p+4*n)); }
+    else if (f>=9 && f<=12) { for (unsigned n=0;n<f-8u;++n) v[n]=float(half(p+2*n)); }
+    else if (f==19) {
+        const uint32_t packed=word(p);
+        for (unsigned n=0;n<3;++n) {
+            const unsigned bits=n==2?10:11, mask=(1u<<bits)-1;
+            v[n]=float((packed>>(n*11))&mask);
+        }
+    } else if (f==14 || f==15) {
+        // Original engine declaration type table 82A40010:
+        // 14=0x2A2190 (signed normalized 11:11:10),
+        // 15=0x2A2090 (unsigned normalized 11:11:10).
+        const uint32_t packed=word(p);
+        for (unsigned n=0;n<3;++n) {
+            const unsigned bits=n==2?10:11, mask=(1u<<bits)-1;
+            const uint32_t raw=(packed>>(n*11))&mask;
+            if (f==15) v[n]=float(raw)/float(mask);
+            else {
+                const int32_t signedValue=int32_t(raw^(1u<<(bits-1)))-int32_t(1u<<(bits-1));
+                v[n]=(std::max)(-1.0f,float(signedValue)/float(mask>>1));
+            }
+        }
+    } else {
+        const auto packed=word(p);
+        for (unsigned n=0;n<4;++n) {
+            const unsigned component=f==18 && (n==0 || n==2)?2-n:n;
+            v[n]=float((packed>>(component*8))&255u);
+            if (f!=17) v[n]/=255.0f;
+        }
+    }
+    return finite(v);
+}
 bool decodeWorldVertices(const StoredGeometry& g, std::vector<WorldVertex>& output) noexcept {
     try {
         std::array<uint32_t,16> offsets{};
@@ -383,40 +469,8 @@ bool decodeWorldVertices(const StoredGeometry& g, std::vector<WorldVertex>& outp
         for (size_t i=first;i<end;++i) {
             std::array<EngineVector,16> slots{};
             for (unsigned s=0;s<16;++s) {
-                auto& v=slots[s]; v={0,0,0,1};
                 const auto f=g.formats[s]; const auto* p=g.vertices.data()+size_t(i)*stride+offsets[s];
-                if(!f)continue; // The implicit (0,0,0,1) stream is already finite.
-                if (f<=4) { for (unsigned n=0;n<f;++n) v[n]=std::bit_cast<float>(word(p+4*n)); }
-                else if (f>=9 && f<=12) { for (unsigned n=0;n<f-8u;++n) v[n]=float(half(p+2*n)); }
-                else if (f==19) {
-                    const uint32_t packed=word(p);
-                    for (unsigned n=0;n<3;++n) {
-                        const unsigned bits=n==2?10:11, mask=(1u<<bits)-1;
-                        v[n]=float((packed>>(n*11))&mask);
-                    }
-                } else if (f==14 || f==15) {
-                    // Original engine declaration type table 82A40010:
-                    // 14=0x2A2190 (signed normalized 11:11:10),
-                    // 15=0x2A2090 (unsigned normalized 11:11:10).
-                    const uint32_t packed=word(p);
-                    for (unsigned n=0;n<3;++n) {
-                        const unsigned bits=n==2?10:11, mask=(1u<<bits)-1;
-                        const uint32_t raw=(packed>>(n*11))&mask;
-                        if (f==15) v[n]=float(raw)/float(mask);
-                        else {
-                            const int32_t signedValue=int32_t(raw^(1u<<(bits-1)))-int32_t(1u<<(bits-1));
-                            v[n]=(std::max)(-1.0f,float(signedValue)/float(mask>>1));
-                        }
-                    }
-                } else {
-                    const auto packed=word(p);
-                    for (unsigned n=0;n<4;++n) {
-                        const unsigned component=f==18 && (n==0 || n==2)?2-n:n;
-                        v[n]=float((packed>>(component*8))&255u);
-                        if (f!=17) v[n]/=255.0f;
-                    }
-                }
-                if (!finite(v)) return false;
+                if (!decodeWorldSlot(p,f,slots[s])) return false;
             }
             auto& v=result[i]; v.position=slots[0]; v.normal=slots[9]; v.color=slots[10];
             for (unsigned t=0;t<8;++t) v.tex[t]=slots[t+1];
@@ -619,8 +673,9 @@ WorldVertexOptions worldVertexOptions(const EngineVertexDescriptor& d) noexcept 
 
 // Internal callers own a fresh, unpublished result, so fill it directly.
 // The public wrapper below still leaves caller output unchanged on failure.
-static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b, WorldVertexOptions& o,
-                                          WorldVertexConstants& c) noexcept {
+template<class Record>
+static bool buildWorldVertexPreparation(const EngineVertexBindingState& b,const uint8_t* bank, WorldVertexOptions& o,
+                                          WorldVertexConstants& c,Record&& record) noexcept {
     const auto& d=b.descriptor;
     auto reject=[&](const char* reason,unsigned first,unsigned count,unsigned vector=UINT32_MAX,unsigned lane=0,uint32_t bits=0) {
         static std::atomic<unsigned> reports{};
@@ -636,11 +691,15 @@ static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b, 
     c.references[0]={d.palette,d.positionConversion,d.color,0};
     auto take=[&](unsigned first,unsigned count) {
         if (first>=256 || count>256-first) return reject("constant-range",first,count);
-        if(copyFiniteVectors(b.constantBytes.data()+first*16,c.vectors.data()+first,count))return true;
+        if(copyFiniteVectors(bank+first*16,c.vectors.data()+first,count)) {
+            c.markWritten(first,count);
+            record(first,count);
+            return true;
+        }
         // Only inspect individual lanes after an existing validation failure.
         // Successful draws retain the same conversion and validation work.
         for(unsigned v=first;v<first+count;++v)for(unsigned lane=0;lane<4;++lane) {
-            const auto bits=word(b.constantBytes.data()+v*16+lane*4);
+            const auto bits=word(bank+v*16+lane*4);
             if((bits&0x7FFFFFFFu)>0x7F7FFFFFu)return reject("nonfinite-constant",first,count,v,lane,bits);
         }
         return reject("constant-copy",first,count);
@@ -697,6 +756,82 @@ static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b, 
     }
     return true;
 }
+
+#if defined(__PROSPERO__) || defined(DARK_TEST_VERTEX_PLAN_CACHE)
+struct VertexProgramPlan {
+    EngineVertexDescriptor descriptor;
+    EngineVertexDescriptor candidate;
+    WorldVertexOptions options;
+    std::array<std::array<uint32_t,4>,9> references{};
+    std::array<uint64_t,4> written{};
+    VertexConstantRanges ranges;
+    bool valid=false,candidateValid=false;
+};
+struct VertexProgramPlanCache {
+    std::array<VertexProgramPlan,64> plans{};
+    VertexProgramPlan* last=nullptr;
+    unsigned lookups=0,hits=0;
+};
+#endif
+static bool prepareWorldVertexProgramBankInto(const EngineVertexBindingState& b,const uint8_t* bank,WorldVertexOptions& o,
+                                          WorldVertexConstants& c,bool allowPlans=true) noexcept {
+    EngineCpuScope sample(EnginePhase::vertexConstants);
+    auto original=[&] {return buildWorldVertexPreparation(b,bank,o,c,[](unsigned,unsigned){});};
+#if defined(__PROSPERO__) || defined(DARK_TEST_VERTEX_PLAN_CACHE)
+    if(!allowPlans || !vertexProgramPlansEnabled.load(std::memory_order_relaxed) ||
+       !vertexProgramPlansSafe.load(std::memory_order_relaxed) || worldDescriptorKeyMismatch(b)<5)
+        return original();
+    static thread_local constinit VertexProgramPlanCache cache{};
+    const auto& d=b.descriptor;
+    VertexProgramPlan* selected=cache.last;
+    if(!selected || !selected->valid || !(selected->descriptor==d)) {
+        uint32_t hash=d.flags^d.coordinateMapping^d.declarationFlags^word(d.modes.data())^
+            std::rotl(word(d.modes.data()+4),13)^(uint32_t(d.palette)<<8)^d.positionConversion^d.color;
+        hash^=hash>>16;hash*=0x7FEB352Du;hash^=hash>>15;
+        selected=&cache.plans[hash&(cache.plans.size()-1)];
+    }
+    auto& plan=*selected;
+    const bool hit=plan.valid && plan.descriptor==d;
+    ++cache.lookups;if(hit)++cache.hits;
+    if(cache.lookups==1024) {
+        vertexProgramPlanLookups.fetch_add(cache.lookups,std::memory_order_relaxed);
+        vertexProgramPlanHits.fetch_add(cache.hits,std::memory_order_relaxed);
+        cache.lookups=cache.hits=0;
+    }
+    if(hit) {
+        for(unsigned r=0;r<plan.ranges.count;++r) {
+            const auto [first,count]=plan.ranges.values[r];
+            if(!copyFiniteVectors(bank+first*16,c.vectors.data()+first,count))
+                return original(); // Original range order, diagnostics and palette fallback.
+        }
+        o=plan.options;c.references=plan.references;c.written=plan.written;
+        cache.last=&plan;
+        return true;
+    }
+    // One-off descriptors should not pay to compile/sort a recipe or evict a
+    // useful plan. Require a second observation in this slot before admission.
+    // This affects optimization only: the original path handles the first.
+    if(!plan.candidateValid || !(plan.candidate==d)) {
+        plan.candidate=d;plan.candidateValid=true;
+        return original();
+    }
+    VertexConstantRanges ranges;
+    if(!buildWorldVertexPreparation(b,bank,o,c,[&](unsigned first,unsigned count) {ranges.add(first,count);}))
+        return false;
+    if(ranges.valid) {
+        ranges.merge();plan.ranges=ranges;plan.descriptor=d;plan.options=o;plan.references=c.references;
+        plan.written=c.written;plan.valid=true;cache.last=&plan;
+    }
+    return true;
+#else
+    return original();
+#endif
+}
+
+static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b,WorldVertexOptions& o,WorldVertexConstants& c,bool allowPlans=true) noexcept {
+    return prepareWorldVertexProgramBankInto(b,b.constantBytes.data(),o,c,allowPlans);
+}
+
 bool prepareWorldVertexProgram(const EngineVertexBindingSnapshot& b, WorldVertexOptions& options,
                                WorldVertexConstants& constants) noexcept {
     WorldVertexOptions o;WorldVertexConstants c;
@@ -749,6 +884,102 @@ bool gpuPaletteAddresses(float index, float scale, unsigned palette, bool* used)
     }
     return true;
 }
+// Which palette rows a skinned draw reads depends only on the immutable vertex
+// bytes its index range names, and on the draw's palette base and scale. The
+// same draw recurs in every pass of every frame (depth, shadow, material), so
+// the proof is memoized: one walk of a 20k-vertex mesh costs ~0.7 ms on the
+// console -- several times a 60 Hz frame -- and paying that per pass per frame
+// was what held the world at 4-7 fps while the front end ran at 60.
+constexpr size_t kPaletteProofWords = (kPaletteVectors + 63) / 64;
+struct PaletteProofEntry {
+    std::weak_ptr<const StoredGeometry> vertices;
+    uint32_t firstIndex = 0, indexCount = 0, scaleBits = 0, palette = 0, weights = 0;
+    std::array<uint64_t, kPaletteProofWords> used{};
+    bool referencesVector135 = false, filled = false;
+};
+constexpr size_t kPaletteProofEntries = 1024;
+std::mutex paletteProofMutex;
+std::array<PaletteProofEntry, kPaletteProofEntries> paletteProofs;
+std::atomic<uint64_t> paletteProofHits{}, paletteProofMisses{};
+// Returns the union of palette rows the draw's own influences may fetch. A
+// proven range is cached against the immutable vertex resource, so a repeat of
+// the same draw costs a lookup.
+bool provePaletteRows(const StoredDraw& geometry, unsigned weights, float scale, uint32_t scaleBits,
+                      unsigned palette, std::array<uint64_t, kPaletteProofWords>& used,
+                      bool& referencesVector135) noexcept {
+    try {
+        const auto& resource = geometry.vertices;
+        const auto slot = ((uintptr_t(resource.get()) >> 5) ^ uintptr_t(geometry.firstIndex) * 2654435761u ^
+                           uintptr_t(geometry.indexCount) << 7 ^ scaleBits ^ uintptr_t(palette) << 17 ^ weights) &
+                          (kPaletteProofEntries - 1);
+        auto& entry = paletteProofs[slot];
+        {
+            std::lock_guard lock(paletteProofMutex);
+            if (entry.filled && entry.vertices.lock() == resource && entry.firstIndex == geometry.firstIndex &&
+                entry.indexCount == geometry.indexCount && entry.scaleBits == scaleBits &&
+                entry.palette == palette && entry.weights == weights) {
+                used = entry.used;
+                referencesVector135 = entry.referencesVector135;
+                paletteProofHits.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+        paletteProofMisses.fetch_add(1, std::memory_order_relaxed);
+        const auto& g = *resource;
+        std::array<uint32_t,16> offsets{};
+        if (!worldVertexLayout(g, offsets)) return false;
+        const auto& indices = geometry.indices->indices;
+        thread_local std::vector<uint8_t> visited;
+        if (visited.size() < g.vertexCount) visited.resize(g.vertexCount);
+        std::memset(visited.data(), 0, g.vertexCount);
+        bool rowUsed[kPaletteVectors] = {};
+        // Influences repeat: a mesh names one influence per bone, not per vertex.
+        // Proving each distinct index value once removes nearly all of the
+        // address work a skeleton would otherwise repeat for every vertex.
+        std::array<uint32_t, 64> seenBits{};
+        std::array<bool, 64> seenValid{};
+        for (uint32_t i = 0; i < geometry.indexCount; ++i) {
+            const uint16_t vertex = indices[geometry.firstIndex + i];
+            if (vertex >= g.vertexCount) return false;
+            if (visited[vertex]) continue;
+            visited[vertex] = 1;
+            const auto* p = g.vertices.data() + size_t(vertex) * g.stride;
+            std::array<EngineVector, 4> influence{};
+            for (unsigned s = 0; s < 4; ++s)
+                if (!decodeWorldSlot(p + offsets[12 + s], g.formats[12 + s], influence[s])) return false;
+            for (unsigned w = 0; w < weights; ++w) {
+                const float index = w < 4 ? influence[0][w] : influence[2][w - 4];
+                const uint32_t bits = std::bit_cast<uint32_t>(index);
+                const auto bucket = (bits * 2654435761u >> 26) & 63u;
+                if (seenValid[bucket] && seenBits[bucket] == bits) continue;
+                seenBits[bucket] = bits;
+                seenValid[bucket] = true;
+                if (!gpuPaletteAddresses(index, scale, palette, rowUsed)) return false;
+            }
+        }
+        bool reference135 = false;
+        for (unsigned r = 0; r < kPaletteVectors; ++r)
+            if (rowUsed[r] && palette + r == 135) reference135 = true;
+        std::array<uint64_t, kPaletteProofWords> rows{};
+        for (unsigned r = 0; r < kPaletteVectors; ++r)
+            if (rowUsed[r]) rows[r / 64] |= uint64_t(1) << (r % 64);
+        {
+            std::lock_guard lock(paletteProofMutex);
+            entry.vertices = resource;
+            entry.firstIndex = geometry.firstIndex;
+            entry.indexCount = geometry.indexCount;
+            entry.scaleBits = scaleBits;
+            entry.palette = palette;
+            entry.weights = weights;
+            entry.used = rows;
+            entry.referencesVector135 = reference135;
+            entry.filled = true;
+        }
+        used = rows;
+        referencesVector135 = reference135;
+        return true;
+    } catch (...) { return false; }
+}
 bool proveAndFillPalette(const EngineVertexBindingSnapshot& b, const StoredDraw& geometry,
                          const WorldVertexOptions& o, WorldVertexConstants& c,
                          unsigned palette, const bool required[256], WorldPaletteProof& proof) noexcept {
@@ -760,38 +991,28 @@ bool proveAndFillPalette(const EngineVertexBindingSnapshot& b, const StoredDraw&
     const auto& formats = geometry.vertices->formats;
     if (!formats[12] || !formats[13]) return false;
     if (o.weights > 4 && (!formats[14] || !formats[15])) return false;
-    std::vector<WorldVertex> decoded;
-    if (!decodeWorldVertices(*geometry.vertices, decoded) || decoded.empty()) return false;
-    bool used[kPaletteVectors] = {};
-    // Actual draw index subset only; a shared immutable buffer may hold other
-    // draws' indices outside [firstIndex, firstIndex+indexCount). Decoded
-    // CPU floats are the same bits uploaded to the GPU.
-    for (uint32_t i = 0; i < geometry.indexCount; ++i) {
-        const uint16_t vertex = geometry.indices->indices[geometry.firstIndex + i];
-        if (vertex >= decoded.size()) return false;
-        const auto& v = decoded[vertex];
-        for (unsigned w = 0; w < o.weights; ++w) {
-            const float index = w < 4 ? v.indices[w] : v.indices2[w - 4];
-            if (!gpuPaletteAddresses(index, scale, palette, used)) return false;
-        }
-    }
+    std::array<uint64_t, kPaletteProofWords> usedRows{};
+    bool referencesVector135 = false;
+    if (!provePaletteRows(geometry, o.weights, scale, std::bit_cast<uint32_t>(scale), palette,
+                          usedRows, referencesVector135)) return false;
+    auto used = [&](unsigned r) { return (usedRows[r / 64] >> (r % 64)) & 1u; };
     proof.usageProven = true;
-    for (unsigned r = 0; r < kPaletteVectors; ++r)
-        if (used[r] && palette + r == 135) proof.referencesVector135 = true;
+    proof.referencesVector135 = referencesVector135;
     // Every actual read must be finite before anything is published.
-    for (unsigned r = 0; r < kPaletteVectors; ++r) if (used[r]) {
+    for (unsigned r = 0; r < kPaletteVectors; ++r) if (used(r)) {
         for (unsigned lane = 0; lane < 4; ++lane) {
             const auto bits = word(b.constantBytes.data() + (palette + r) * 16 + lane * 4);
             if ((bits & 0x7FFFFFFFu) > 0x7F7FFFFFu) return false;
         }
     }
     unsigned ignored = 0, usedCount = 0;
+    c.markWritten(palette, kPaletteVectors);
     for (unsigned r = 0; r < kPaletteVectors; ++r) {
         const unsigned row = palette + r;
-        if (used[r] || required[row]) {
+        if (used(r) || required[row]) {
             for (unsigned lane = 0; lane < 4; ++lane)
                 c.vectors[row][lane] = std::bit_cast<float>(word(b.constantBytes.data() + row * 16 + lane * 4));
-            if (used[r]) ++usedCount;
+            if (used(r)) ++usedCount;
         } else {
             if (!ignored) proof.firstIgnoredRow = row;
             if (proof.firstIgnoredNonfiniteRow == 256) {
@@ -837,6 +1058,7 @@ bool prepareWorldVertexProgramWithGeometry(const EngineVertexBindingSnapshot& b,
         auto takeStrict = [&](unsigned first, unsigned count) {
             if (first >= 256 || count > 256 - first) return false;
             if (!copyFiniteVectors(b.constantBytes.data() + first * 16, c.vectors.data() + first, count)) return false;
+            c.markWritten(first, count);
             for (unsigned v = first; v < first + count; ++v) required[v] = true;
             return true;
         };
@@ -871,6 +1093,7 @@ bool prepareWorldVertexProgramWithGeometry(const EngineVertexBindingSnapshot& b,
             const unsigned palette = d.palette;
             if (palette >= 256 || kPaletteVectors > 256 - palette) return false;
             if (copyFiniteVectors(b.constantBytes.data() + palette * 16, c.vectors.data() + palette, kPaletteVectors)) {
+                c.markWritten(palette, kPaletteVectors);
                 for (unsigned r = 0; r < kPaletteVectors; ++r) required[palette + r] = true;
             } else if (!proveAndFillPalette(b, geometry, o, c, palette, required, local)) {
                 static std::atomic<unsigned> rejects{};
@@ -893,8 +1116,14 @@ uint16_t worldFragmentTextureMask(std::string_view name,uint32_t flags) noexcept
     // pointer; masks come from the hash-pinned original shader translator.
     thread_local const WorldFragmentBinding* previous=nullptr;
     if(previous && previous->flags==flags && name==previous->name)return uint16_t(previous->textures);
-    for(const auto& binding:worldFragmentBindings)if(binding.flags==flags && name==binding.name) {
-        previous=&binding;return uint16_t(binding.textures);
+    static constexpr auto index=ShaderLookup::index<std::size(worldFragmentBindings)>([](size_t i) {
+        const auto& binding=worldFragmentBindings[i];return ShaderLookup::fragment(binding.name,binding.flags);
+    });
+    size_t slot=ShaderLookup::fragment(name,flags)&(index.size()-1);
+    while(index[slot]>=0) {
+        const auto& binding=worldFragmentBindings[index[slot]];
+        if(binding.flags==flags && name==binding.name) {previous=&binding;return uint16_t(binding.textures);}
+        slot=(slot+1)&(index.size()-1);
     }
     return 0xFFFF; // Preserve unknown-program diagnostics and future resources.
 }
@@ -919,12 +1148,13 @@ static bool snapshotWorldTargets(uint8_t* base,uint32_t device,WorldSurfaceTarge
     }
     output=result;return true;
 }
-static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,WorldDraw& result) noexcept {
+static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,WorldDraw& result,
+    const EngineVertexBindingState* directBinding=nullptr,bool canonical=false) noexcept {
     result.promptContext = currentPromptRenderContext();
     result.subtitle = currentSubtitleRenderContext();
-    ++observed;
+    if(!directBinding)incrementWorldCounter(0);
     auto fail=[&](unsigned step) {
-        ++rejected;
+        if(!directBinding)incrementWorldCounter(2);
         static std::array<std::atomic<unsigned>,13> reports{};
         if(step<reports.size() && reports[step]++<4)
             std::fprintf(stderr,"[EngineWorldSnapshotRejected] step=%u geometry=%08X\n",step,
@@ -932,9 +1162,10 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
         return false;
     };
     try {
-        if (!geometry || !geometry.vertexBindings || !geometry.vertexBindings->deviceAddress ||
-            uint64_t(geometry.vertexBindings->deviceAddress)+12600>0x100000000ull) return fail(1);
-        if (!prepareWorldVertexProgramInto(*geometry.vertexBindings,result.options,result.constants)) {
+        const EngineVertexBindingState* binding=directBinding?directBinding:(geometry.vertexBindings?&*geometry.vertexBindings:nullptr);
+        if (!geometry || !binding || !binding->deviceAddress ||
+            uint64_t(binding->deviceAddress)+12600>0x100000000ull) return fail(1);
+        if (!directBinding && !prepareWorldVertexProgramInto(*geometry.vertexBindings,result.options,result.constants,!canonical)) {
             // Strict full-palette validation failed. Retry once with a
             // geometry-aware proof that only proven-unread rows may be
             // sanitized; publish only when every actual read is finite.
@@ -945,7 +1176,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
                                                        fallbackOptions, fallbackConstants, &paletteProof)) {
                 static std::atomic<unsigned> reports{};
                 if(reports++<16) {
-                    const auto& d=geometry.vertexBindings->descriptor;
+                    const auto& d=binding->descriptor;
                     std::fprintf(stderr,"[EngineWorldVertexUnsupported] flags=%08X modes=%u,%u,%u,%u,%u,%u,%u,%u palette=%u geometry=%08X\n",
                         d.flags,d.modes[0],d.modes[1],d.modes[2],d.modes[3],d.modes[4],d.modes[5],d.modes[6],d.modes[7],d.palette,geometry.vertices->address);
                 }
@@ -956,8 +1187,8 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
         std::array<uint8_t,20> program; std::array<uint8_t,24> viewport;
         if (!copyRenderMemory(base,context+16896,result.attributes.data(),160) ||
             !copyRenderMemory(base,context+17152,viewport.data(),24) ||
-            !snapshotWorldTargets(base,geometry.vertexBindings->deviceAddress,result) ||
-            !snapshotWorldClipPlanes(base,geometry.vertexBindings->deviceAddress,result.clipPlanes)) return fail(3);
+            !snapshotWorldTargets(base,binding->deviceAddress,result) ||
+            !snapshotWorldClipPlanes(base,binding->deviceAddress,result.clipPlanes)) return fail(3);
         for (unsigned i=0;i<4;++i) result.viewport[i]=word(viewport.data()+4*i);
         result.depthRange={std::bit_cast<float>(word(viewport.data()+16)),std::bit_cast<float>(word(viewport.data()+20)),0,0};
         if(!finite(result.depthRange) || result.depthRange[0]<0 || result.depthRange[0]>1 || result.depthRange[1]<0 || result.depthRange[1]>1) return fail(4);
@@ -979,7 +1210,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
             // Original822478C0 uploads to device+6016. Read that completed
             // copy, not the GUI's mutable program parameter allocation.
             // Exactly the copied count vectors are consumed; count0 reads none.
-            if (count && !copyRenderMemory(base,geometry.vertexBindings->deviceAddress+6016,env.data(),count*16)) return fail(7);
+            if (count && !copyRenderMemory(base,binding->deviceAddress+6016,env.data(),count*16)) return fail(7);
             for (unsigned v=0;v<count;++v) {
                 for (unsigned l=0;l<4;++l) result.fragmentConstants[v][l]=std::bit_cast<float>(word(env.data()+v*16+l*4));
                 // These are shader data, not host indices or extents. The
@@ -1003,7 +1234,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
             if(stages>=std::size(programs)) return fail(9);
             result.fragmentName=programs[stages];
             std::array<uint8_t,16> env{};
-            if(stages && !copyRenderMemory(base,geometry.vertexBindings->deviceAddress+6016,env.data(),16)) return fail(10);
+            if(stages && !copyRenderMemory(base,binding->deviceAddress+6016,env.data(),16)) return fail(10);
             for(unsigned lane=0;lane<4;++lane)result.fragmentConstants[0][lane]=std::bit_cast<float>(word(env.data()+lane*4));
             if(!finite(result.fragmentConstants[0])) return fail(10);
         }
@@ -1012,7 +1243,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
         // image. Other passes retain every source-declared slot, even if D3D
         // subsequently optimizes an unused fetch out of this permutation.
         if(result.textureMask) {
-            const auto device=geometry.vertexBindings->deviceAddress;
+            const auto device=binding->deviceAddress;
             // Original82864F20 stores the completed object at12536+slot*4
             // and its fetch/sampler descriptor at1152+slot*24. 822569E0 skips
             // rebinding unchanged IDs: a subsequently switched resource-table
@@ -1058,7 +1289,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
                                 word(original.data()+12),word(original.data()+16),word(original.data()+20));
                             if(group==0 && report==0) {
                                 std::array<uint8_t,1536> ramp{};
-                                const auto device=geometry.vertexBindings->deviceAddress;
+                                const auto device=binding->deviceAddress;
                                 const bool rampReadable=copyRenderMemory(base,device+14980,ramp.data(),ramp.size());
                                 std::fprintf(stderr,"[OtherWorldDisplayGamma] device=%08X readable=%u rampBE=",device,unsigned(rampReadable));
                                 for(const auto byte:ramp)std::fprintf(stderr,"%02X",unsigned(byte));
@@ -1116,7 +1347,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
                 result.textureObjects[s]=texture;
             }
         }
-        ++captured;return true;
+        if(!directBinding)incrementWorldCounter(1);return true;
     } catch (...) {return fail(12);}
 }
 bool snapshotWorldDraw(uint8_t* base,const StoredDraw& geometry,WorldDraw& output) noexcept {
@@ -1124,6 +1355,134 @@ bool snapshotWorldDraw(uint8_t* base,const StoredDraw& geometry,WorldDraw& outpu
     if(!snapshotWorldDrawInto(base,geometry,result))return false;
     result.geometry={geometry.vertices,geometry.indices,geometry.firstIndex,geometry.indexCount};
     output=std::move(result);return true;
+}
+namespace {
+ThreadCounters<4> nativeCaptureCounts;
+auto nativeCaptureWriter() {
+    static thread_local constinit ThreadCounters<4>::Writer writer{};
+    auto current=writer;
+    if(!current) {current=nativeCaptureCounts.acquireWriter();writer=current;}
+    return current;
+}
+void incrementNativeCapture(unsigned counter) {nativeCaptureWriter().increment(counter);}
+#if defined(__PROSPERO__) || defined(DARK_TEST_NATIVE_CAPTURE)
+__attribute__((target("ssse3"))) bool equalPreparedRows(const uint8_t* bank,const WorldVertexConstants& constants) noexcept {
+    const auto endian=_mm_setr_epi8(3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12);
+    for(unsigned word=0;word<4;++word) {
+        auto bits=constants.written[word];
+        while(bits) {
+            const unsigned first=std::countr_zero(bits),count=std::countr_one(bits>>first);
+            auto difference=_mm_setzero_si128();
+            for(unsigned row=word*64+first;row<word*64+first+count;++row) {
+                const auto live=_mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(bank+row*16)),endian);
+                const auto owned=_mm_loadu_si128(reinterpret_cast<const __m128i*>(constants.vectors[row].data()));
+                difference=_mm_or_si128(difference,_mm_xor_si128(live,owned));
+            }
+            if(_mm_movemask_epi8(_mm_cmpeq_epi8(difference,_mm_setzero_si128()))!=0xffff)return false;
+            if(first+count==64)break;
+            bits&=~((uint64_t(1)<<(first+count))-1);
+        }
+    }
+    return true;
+}
+struct NativeCaptureContext {const StoredDraw* geometry;WorldDraw* result;};
+bool captureFromLiveBinding(uint8_t* base,const EngineVertexBindingState& binding,const uint8_t* bank,void* opaque) noexcept {
+    auto& context=*static_cast<NativeCaptureContext*>(opaque);
+    auto& result=*context.result;
+    const uint64_t address=uint64_t(binding.deviceAddress)+1920;
+    if(!base || !binding.deviceAddress || address+4096>0x100000000ull || bank!=base+address)return false;
+    // Both the read and reread are distinct compiler observations. Keep the
+    // original finite/range/mode/key validator; failed palettes use the owned
+    // fallback rather than weakening strict validation on the live path.
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if(!prepareWorldVertexProgramBankInto(binding,bank,result.options,result.constants) ||
+       !snapshotWorldDrawInto(base,*context.geometry,result,&binding))return false;
+#if defined(DARK_TEST_NATIVE_CAPTURE)
+    if(nativeCaptureBeforeValidation)nativeCaptureBeforeValidation(base);
+#endif
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const bool equal=equalPreparedRows(bank,result.constants);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#if defined(DARK_TEST_NATIVE_CAPTURE)
+    if(equal && nativeCaptureAfterValidation)nativeCaptureAfterValidation(result);
+#endif
+    return equal;
+}
+#endif
+}
+NativeWorldCaptureStats nativeWorldCaptureStats() noexcept {
+    const auto counts=nativeCaptureCounts.snapshot();return {counts[0],counts[1],counts[2],counts[3]};
+}
+void rejectNativeWorldCaptureComparison() noexcept {
+    vertexProgramPlansSafe.store(false,std::memory_order_relaxed);
+    nativeWorldCaptureSafe.store(false,std::memory_order_relaxed);incrementNativeCapture(3);
+}
+std::shared_ptr<WorldDraw> captureNativeWorldDraw(uint8_t* base,StoredDraw& geometry) noexcept {
+#if defined(__PROSPERO__) || defined(DARK_TEST_NATIVE_CAPTURE)
+    auto counts=nativeCaptureWriter();counts.increment(0);
+    try {
+        auto result=acquireWorldDraw();NativeCaptureContext context{&geometry,result.get()};
+        if(withCurrentEngineVertexBinding(base,captureFromLiveBinding,&context)) {
+            result->geometry={std::move(geometry.vertices),std::move(geometry.indices),geometry.firstIndex,geometry.indexCount};
+            auto world=worldCounterWriter();world.increment(0);world.increment(1);
+            counts.increment(1);return result;
+        }
+    }catch(...){}
+    counts.increment(2);
+#endif
+    return {};
+}
+#if defined(DARK_TEST_NATIVE_CAPTURE)
+std::shared_ptr<WorldDraw> testCaptureNativeBinding(uint8_t* base,const EngineVertexBindingState& binding,const StoredDraw& geometry) noexcept {
+    auto result=acquireWorldDraw();
+    const uint64_t address=uint64_t(binding.deviceAddress)+1920;
+    if(!base || !binding.deviceAddress || address+4096>0x100000000ull)return {};
+    NativeCaptureContext context{&geometry,result.get()};
+    if(!captureFromLiveBinding(base,binding,base+address,&context))return {};
+    result->geometry={geometry.vertices,geometry.indices,geometry.firstIndex,geometry.indexCount};return result;
+}
+#endif
+bool equivalentWorldCaptures(const WorldDraw& a,const WorldDraw& b) noexcept {
+    if(a.geometry.vertices!=b.geometry.vertices || a.geometry.indices!=b.geometry.indices ||
+       a.geometry.firstIndex!=b.geometry.firstIndex || a.geometry.indexCount!=b.geometry.indexCount ||
+       a.options!=b.options || a.attributes!=b.attributes || a.viewport!=b.viewport ||
+       a.targets!=b.targets || a.material!=b.material || a.fragmentName!=b.fragmentName ||
+       a.fragmentFlags!=b.fragmentFlags || a.textureIds!=b.textureIds || a.textureMask!=b.textureMask ||
+       a.promptContext!=b.promptContext || a.subtitle!=b.subtitle || a.clipPlanes.control!=b.clipPlanes.control ||
+       std::memcmp(a.depthRange.data(),b.depthRange.data(),sizeof(a.depthRange)) ||
+       std::memcmp(a.clipPlanes.planes.data(),b.clipPlanes.planes.data(),sizeof(a.clipPlanes.planes)) ||
+       std::memcmp(a.constants.vectors.data(),b.constants.vectors.data(),sizeof(a.constants.vectors)) ||
+       a.constants.references!=b.constants.references || a.constants.written!=b.constants.written ||
+       std::memcmp(a.fragmentConstants.data(),b.fragmentConstants.data(),sizeof(a.fragmentConstants)))return false;
+    for(unsigned i=0;i<5;++i) {
+        const auto& x=a.surfaceBindings[i];const auto& y=b.surfaceBindings[i];
+        if(x.layout!=y.layout || x.info!=y.info || x.completed!=y.completed)return false;
+    }
+    for(unsigned i=0;i<16;++i) {
+        const auto& x=a.textureObjects[i];const auto& y=b.textureObjects[i];
+        if(x.object!=y.object)return false;
+        // Unbound objects have no readable image shape; fresh and pooled
+        // draws historically differ in these unused default fields.
+        if(x.object && (x.storage!=y.storage || x.width!=y.width || x.height!=y.height ||
+            x.format!=y.format || x.exponent!=y.exponent || x.faces!=y.faces ||
+            x.mipLevels!=y.mipLevels || x.firstMip!=y.firstMip))return false;
+        const auto& p=a.samplers[i];const auto& q=b.samplers[i];
+        if(p.valid!=q.valid || p.minLinear!=q.minLinear || p.magLinear!=q.magLinear ||
+           p.mipLinear!=q.mipLinear || p.baseOnly!=q.baseOnly || p.lodValid!=q.lodValid ||
+           p.address!=q.address || p.anisotropy!=q.anisotropy || p.minLevel!=q.minLevel ||
+           p.maxLevel!=q.maxLevel || p.border!=q.border ||
+           std::bit_cast<uint32_t>(p.bias)!=std::bit_cast<uint32_t>(q.bias) || a.textures[i]!=b.textures[i])return false;
+    }
+    return true;
+}
+std::shared_ptr<WorldDraw> captureWorldDrawCanonical(uint8_t* base,const StoredDraw& geometry) noexcept {
+    try {
+        auto result=acquireWorldDraw();
+        if(snapshotWorldDrawInto(base,geometry,*result,nullptr,true)) {
+            result->geometry={geometry.vertices,geometry.indices,geometry.firstIndex,geometry.indexCount};return result;
+        }
+    }catch(...){}
+    return {};
 }
 std::shared_ptr<WorldDraw> captureWorldDraw(uint8_t* base,const StoredDraw& geometry) noexcept {
     try {
@@ -1215,7 +1574,7 @@ bool snapshotWorldResolve(uint8_t* base,uint32_t device,uint32_t flags,uint32_t 
     if(mip || face>=r.destination.faces)return false;
     output=r;return true;
 }
-void recordWorldSubmission(WorldMaterial m) { ++submitted[unsigned(m)]; }
+void recordWorldSubmission(WorldMaterial m) { incrementWorldCounter(3+unsigned(m)); }
 bool snapshotWorldClear(uint8_t* base,uint32_t device,uint32_t flags,uint32_t color,
                         float depth,uint32_t stencil,WorldClear& output) noexcept {
     if (!device || uint64_t(device)+12452>0x100000000ull || !(flags&49) || !std::isfinite(depth)) return false;
@@ -1229,11 +1588,20 @@ bool snapshotWorldClear(uint8_t* base,uint32_t device,uint32_t flags,uint32_t co
     if(result.viewport[0]>4096-result.viewport[2] || result.viewport[1]>4096-result.viewport[3])return false;
     output=result;return true;
 }
+void printWorldPaletteProofCounters() {
+    std::fprintf(stderr,"[EnginePaletteProof] hits=%llu misses=%llu\n",
+        paletteProofHits.load(std::memory_order_relaxed),paletteProofMisses.load(std::memory_order_relaxed));
+}
 void printWorldCounters() {
+    const auto counts=worldCounts.snapshot();
     std::fprintf(stderr,"[EngineWorld] observed=%llu captured=%llu rejected=%llu submittedDepth=%llu submittedMotion=%llu submittedLit=%llu submittedFixed=%llu submittedPost=%llu\n",
-        observed.load(),captured.load(),rejected.load(),submitted[0].load(),submitted[1].load(),submitted[2].load(),submitted[3].load(),submitted[4].load());
+        counts[0],counts[1],counts[2],counts[3],counts[4],counts[5],counts[6],counts[7]);
     std::fprintf(stderr,"[EngineImmediate] canonicalRecovered=%llu canonicalRefused=%llu recovered1371=%llu recovered1477=%llu\n",
         immediateCanonicalRecovered.load(),immediateCanonicalRefused.load(),
         immediateCanonicalRecoveredTex1371.load(),immediateCanonicalRecoveredTex1477.load());
+    // A hit means a repeated pass or frame reused a proven palette, which is the
+    // difference between a skinned draw costing microseconds and milliseconds.
+    std::fprintf(stderr,"[EnginePaletteProof] hits=%llu misses=%llu\n",
+        paletteProofHits.load(),paletteProofMisses.load());
 }
 }

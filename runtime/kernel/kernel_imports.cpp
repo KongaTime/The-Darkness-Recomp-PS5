@@ -1,16 +1,202 @@
 #include "kernel_imports.h"
 #include "host_filesystem.h"
-#include <windows.h>
-#include <dbghelp.h>
-#include <intrin.h>
-#include <xinput.h>
 #include <iostream>
 #include <unordered_map>
 #include <mutex>
 #include <vector>
 #include <cstring>
+#include <string>
+#if defined(_WIN32)
+#include <windows.h>
+#include <dbghelp.h>
+#include <intrin.h>
+#include <xinput.h>
+#else
+// PS5: Win32 sync, thread, timer and input calls mapped onto pthreads and POSIX.
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <cstdint>
+#include <cstddef>
+#include "runtime/native/input_ps5.h"
+#include "runtime/native/audio_ps5_driver.h"
+#define _byteswap_ulong(x) __builtin_bswap32(x)
+#define _byteswap_ushort(x) __builtin_bswap16(x)
+#define _byteswap_uint64(x) __builtin_bswap64(x)
+#define WINAPI
+#define DWORD uint32_t
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+#define WAIT_OBJECT_0 0
+#define WAIT_TIMEOUT 0x102
+#define STILL_ACTIVE 259
+#define ERROR_SUCCESS 0
+using HANDLE = void*;
+using LPVOID = void*;
+using DWORD64 = uint64_t;
+struct LARGE_INTEGER { int64_t QuadPart; };
+using LONG64 = int64_t;
+inline LONG64 InterlockedIncrement64(volatile LONG64* p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+using LONG = int32_t;
+#define ERROR_GEN_FAILURE 31
+#define ERROR_FILE_NOT_FOUND 2
+#define ERROR_INVALID_HANDLE 6
+#define ERROR_HANDLE_EOF 38
+#define EXCEPTION_EXECUTE_HANDLER 1
+// SEH: PS5 has no structured exceptions, so guarded blocks run unguarded.
+#define __try if (true)
+#define __except(x) if (false)
+struct FILETIME { uint32_t dwLowDateTime; uint32_t dwHighDateTime; };
+struct CRITICAL_SECTION { pthread_mutex_t m; };
+// Win32 critical sections are recursive; pthread recursive mutex matches.
+inline void InitializeCriticalSection(CRITICAL_SECTION* cs) {
+    pthread_mutexattr_t a; pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&cs->m, &a); pthread_mutexattr_destroy(&a);
+}
+inline void InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION* cs, DWORD) { InitializeCriticalSection(cs); }
+inline void EnterCriticalSection(CRITICAL_SECTION* cs) { pthread_mutex_lock(&cs->m); }
+inline void LeaveCriticalSection(CRITICAL_SECTION* cs) { pthread_mutex_unlock(&cs->m); }
+inline int TryEnterCriticalSection(CRITICAL_SECTION* cs) { return pthread_mutex_trylock(&cs->m) == 0; }
+// Kernel event / semaphore: a mutex + condvar pair with a signal count.
+struct PsEvent { pthread_mutex_t m; pthread_cond_t c; int count; bool manual; };
+inline HANDLE CreateEventA(void*, int manual, int initial, const char*) {
+    auto* e = new PsEvent{};
+    pthread_mutex_init(&e->m, nullptr); pthread_cond_init(&e->c, nullptr);
+    e->count = initial ? 1 : 0; e->manual = manual != 0;
+    return e;
+}
+inline int SetEvent(HANDLE h) {
+    auto* e = static_cast<PsEvent*>(h);
+    pthread_mutex_lock(&e->m); e->count = 1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m);
+    return 1;
+}
+inline int ResetEvent(HANDLE h) {
+    auto* e = static_cast<PsEvent*>(h);
+    pthread_mutex_lock(&e->m); e->count = 0; pthread_mutex_unlock(&e->m);
+    return 1;
+}
+inline HANDLE CreateSemaphoreA(void*, long initial, long, const char*) {
+    auto* e = new PsEvent{};
+    pthread_mutex_init(&e->m, nullptr); pthread_cond_init(&e->c, nullptr);
+    e->count = (int)initial; e->manual = false;
+    return e;
+}
+inline int ReleaseSemaphore(HANDLE h, long n, long*) {
+    auto* e = static_cast<PsEvent*>(h);
+    pthread_mutex_lock(&e->m); e->count += (int)n; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m);
+    return 1;
+}
+// Waits up to timeoutMs. Returns WAIT_OBJECT_0 when signaled, else WAIT_TIMEOUT.
+inline DWORD WaitForSingleObject(HANDLE h, DWORD timeoutMs) {
+    auto* e = static_cast<PsEvent*>(h);
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeoutMs / 1000; ts.tv_nsec += (long)(timeoutMs % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&e->m);
+    int rc = 0;
+    while (e->count <= 0 && rc == 0) rc = pthread_cond_timedwait(&e->c, &e->m, &ts);
+    bool ok = e->count > 0;
+    if (ok && !e->manual) e->count--;
+    pthread_mutex_unlock(&e->m);
+    return ok ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
+}
+inline void Sleep(DWORD ms) { usleep((useconds_t)ms * 1000u); }
+inline void SleepEx(DWORD ms, int) { Sleep(ms); }
+inline void CloseHandle(HANDLE h) { (void)h; }
+// Monotonic counter in nanoseconds; QueryPerformanceFrequency reports 1e9.
+inline int QueryPerformanceFrequency(LARGE_INTEGER* li) { li->QuadPart = 1000000000LL; return 1; }
+inline int QueryPerformanceCounter(LARGE_INTEGER* li) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    li->QuadPart = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec; return 1;
+}
+// Threads: CreateThread runs the start routine on a pthread. The routine has
+// Win32 signature DWORD WINAPI f(LPVOID), so the wrapper returns its value.
+inline HANDLE CreateThread(void*, size_t, DWORD (*fn)(LPVOID), LPVOID arg, DWORD, DWORD*) {
+    struct Start { DWORD (*fn)(LPVOID); LPVOID arg; };
+    auto* s = new Start{fn, arg};
+    pthread_t t;
+    auto run = [](void* p) -> void* {
+        auto* st = static_cast<Start*>(p);
+        st->fn(st->arg);
+        delete st;
+        return nullptr;
+    };
+    if (pthread_create(&t, nullptr, run, s) != 0) { delete s; return nullptr; }
+    pthread_detach(t);
+    return reinterpret_cast<HANDLE>(t);
+}
+inline void TerminateThread(HANDLE, DWORD) {}
+inline void ExitThread(DWORD) { pthread_exit(nullptr); }
+inline HANDLE GetCurrentThread() { return reinterpret_cast<HANDLE>(pthread_self()); }
+inline DWORD GetCurrentThreadId() { return (DWORD)(uintptr_t)pthread_self(); }
+inline BOOL GetExitCodeThread(HANDLE, DWORD* ec) { *ec = 0; return TRUE; }
+// No stack walker on PS5: diagnostic symbolication is a no-op.
+struct CONTEXT { uint64_t Rip, Rbp, Rsp; };
+inline void RtlCaptureContext(CONTEXT*) {}
+struct SYMBOL_INFO { uint32_t SizeOfStruct; uint32_t MaxNameLen; char Name[1]; };
+using PSYMBOL_INFO = SYMBOL_INFO*;
+inline int SymFromAddr(HANDLE, uint64_t, uint64_t*, SYMBOL_INFO*) { return 0; }
+struct EXCEPTION_RECORD { uint32_t ExceptionCode; void* ExceptionAddress; uint32_t NumberParameters; uint64_t ExceptionInformation[2]; };
+struct EXCEPTION_POINTERS { EXCEPTION_RECORD* ExceptionRecord; CONTEXT* ContextRecord; };
+using PEXCEPTION_POINTERS = EXCEPTION_POINTERS*;
+inline uint32_t GetExceptionCode() { return 0; }
+inline void SymInitialize(HANDLE, void*, int) {}
+struct ADDRESS64 { uint64_t Offset; int Mode; };
+struct STACKFRAME64 { ADDRESS64 AddrPC, AddrFrame, AddrStack; };
+#define AddrModeFlat 3
+#define IMAGE_FILE_MACHINE_AMD64 0x8664
+inline int StackWalk64(int, HANDLE, HANDLE, STACKFRAME64*, CONTEXT*, void*, void*, void*, void*) { return 0; }
+inline void* SymFunctionTableAccessImpl(HANDLE, uint64_t) { return nullptr; }
+inline uint64_t SymGetModuleBaseImpl(HANDLE, uint64_t) { return 0; }
+#define SymFunctionTableAccess64 nullptr
+#define SymGetModuleBase64 nullptr
+#include <cstdio>
+// MSVC sprintf_s(dst, fmt, ...) takes no capacity; the destination is a char array here.
+#define sprintf_s(dst, ...) snprintf(dst, sizeof(dst), __VA_ARGS__)
+using ULONG_PTR = uint64_t;
+inline HANDLE GetCurrentProcess() { return nullptr; }
+#define _ReturnAddress() __builtin_return_address(0)
+// No XInput on PS5: XamInputGetState's platform call is answered from the
+// console's own pad (runtime/native/input_ps5.cpp), in XInput's units.
+struct XINPUT_GAMEPAD { uint16_t wButtons; uint8_t bLeftTrigger, bRightTrigger; int16_t sThumbLX, sThumbLY, sThumbRX, sThumbRY; };
+struct XINPUT_STATE { uint32_t dwPacketNumber; XINPUT_GAMEPAD Gamepad; };
+inline DWORD XInputGetState(DWORD userIndex, XINPUT_STATE* state) {
+    constexpr DWORD kNotConnected = 1167; // ERROR_DEVICE_NOT_CONNECTED
+    if (!state || userIndex != 0) return kNotConnected;
+    DarkRecomp::Native::Ps5Pad::PadState pad;
+    if (!DarkRecomp::Native::Ps5Pad::readPad(pad)) return kNotConnected;
+    state->dwPacketNumber = pad.packet;
+    state->Gamepad.wButtons = pad.buttons;
+    state->Gamepad.bLeftTrigger = pad.leftTrigger;
+    state->Gamepad.bRightTrigger = pad.rightTrigger;
+    state->Gamepad.sThumbLX = pad.leftX;
+    state->Gamepad.sThumbLY = pad.leftY;
+    state->Gamepad.sThumbRX = pad.rightX;
+    state->Gamepad.sThumbRY = pad.rightY;
+    return ERROR_SUCCESS;
+}
+inline void GetSystemTimeAsFileTimeUnused() {}
+inline void GetSystemTimeAsFileTime(FILETIME* ft) {
+    // Windows FILETIME: 100ns ticks since 1601-01-01.
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t t = (uint64_t)ts.tv_sec * 10000000ULL + (uint64_t)ts.tv_nsec / 100ULL + 116444736000000000ULL;
+    ft->dwLowDateTime = (uint32_t)t; ft->dwHighDateTime = (uint32_t)(t >> 32);
+}
+#endif
+#include <iostream>
+#include <unordered_map>
+#include <mutex>
+#include <vector>
+#include <cstring>
+#if defined(_WIN32)
 #include "renderer/d3d11/display_context_d3d11.h"
-#include "ppc/ppc_context.h"
+#else
+// PS5: the D3D11 display context is not built; it is only held by pointer here.
+namespace DarkRecomp { class CDisplayContextD3D11; }
+#endif
+#include "ppc_context.h"
 
 // Forward declare PPC_FUNC signature
 #define PPC_FUNC(x) void x(PPCContext& __restrict ctx, uint8_t* base)
@@ -448,7 +634,8 @@ static void LogBugCheck(PPCContext& ctx, uint8_t* base, const char* name) {
                   << " p3=0x" << ctx.r6.u32 << " p4=0x" << ctx.r7.u32
                   << std::dec << " (guest r1=0x" << std::hex << ctx.r1.u32 << std::dec << ")"
                   << std::endl;
-        // Host stack to find the PPC caller.
+#if defined(_WIN32)
+        // Host stack to find the PPC caller. Windows-only: dbghelp has no PS5 equivalent.
         HANDLE hProcess = GetCurrentProcess();
         HANDLE hThread = GetCurrentThread();
         SymInitialize(hProcess, nullptr, TRUE);
@@ -478,6 +665,7 @@ static void LogBugCheck(PPCContext& ctx, uint8_t* base, const char* name) {
             if (nm.find("_xstart") != std::string::npos && frame > 2) break;
         }
         std::cout.flush();
+#endif
     }
     // Slow the spin so the log stays readable and other threads can run.
     if ((n % 1000) == 0) Sleep(1);
@@ -494,28 +682,43 @@ PPC_FUNC(__imp__KeBugCheckEx) {
 // 4. Memory Allocations
 PPC_FUNC(__imp__MmQueryStatistics) {
     KTRACE();
-    // MM_STATISTICS (Xbox): first ULONG Length, then page counts.
-    // Fill with plausible 512MB unified-memory values so CRT heap init proceeds.
-    // struct (BE in guest): +0 Length, +4 TotalPhysicalPages, +8 AvailablePages,
-    // +12 TotalVirtual, +16 AvailableVirtual, ... zero rest.
-    uint32_t pStats = ctx.r3.u32;
-    if (pStats) {
-        __try {
-            uint32_t len = _byteswap_ulong(*reinterpret_cast<uint32_t*>(base + pStats));
-            if (len == 0 || len > 128) len = 64;
-            uint8_t* out = base + pStats;
-            // Preserve Length, fill counts (all BE).
-            const uint32_t totalPages = 131072;   // 512MB / 4KB
-            const uint32_t availPages = 100000;   // leave room for image
-            if (len >= 8)  *reinterpret_cast<uint32_t*>(out + 4) = _byteswap_ulong(totalPages);
-            if (len >= 12) *reinterpret_cast<uint32_t*>(out + 8) = _byteswap_ulong(availPages);
-            if (len >= 16) *reinterpret_cast<uint32_t*>(out + 12) = _byteswap_ulong(totalPages * 4096);
-            if (len >= 20) *reinterpret_cast<uint32_t*>(out + 16) = _byteswap_ulong(availPages * 4096);
-            for (uint32_t i = 20; i < len; i++) out[i] = 0;
-            std::cout << "[Kernel] MmQueryStatistics(0x" << std::hex << pStats
-                      << std::dec << ", len=" << len << ") -> 512MB plausible" << std::endl;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // The retail MM_STATISTICS is 104 bytes, with KernelPages at +8 and
+    // Title.AvailablePages at +12; the layout and values are runtime/native/
+    // kernel.cpp's, which the Windows build boots with. This bridge used to
+    // write virtual byte counts at +12 and +16, so the engine's GlobalMemoryStatus
+    // (sub_828A9F98) sized its pools from garbage and its first pool allocation
+    // (sub_82216FE0) handed back address 4: the console's first guest failure,
+    // a virtual call through a null vtable at 0x82215030 (2026-10-24).
+    const uint32_t address = ctx.r3.u32;
+    if (!address) { ctx.r3.u64 = 0xc000000d; return; }
+    auto write32 = [&](uint32_t offset, uint32_t value) {
+        *reinterpret_cast<uint32_t*>(base + address + offset) = _byteswap_ulong(value);
+    };
+    if (_byteswap_ulong(*reinterpret_cast<uint32_t*>(base + address)) != 104) {
+        ctx.r3.u64 = 0xc0000023;
+        return;
     }
+    uint32_t heapBytes = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
+        heapBytes = g_guestHeapOffset - 0x10000000u;
+    }
+    const uint32_t imagePages = uint32_t(PPC_IMAGE_SIZE / 4096);
+    constexpr uint32_t stackPages = 0x1000000 / 4096;
+    constexpr uint32_t physicalPages = 512 * 1024 * 1024 / 4096;
+    const uint32_t usedPages = heapBytes / 4096 + imagePages + stackPages;
+    memset(base + address, 0, 104);
+    write32(0, 104);
+    write32(4, physicalPages);
+    write32(12, physicalPages - usedPages);
+    write32(16, 0x50000000);
+    write32(20, heapBytes);
+    write32(24, usedPages);
+    write32(32, stackPages);
+    write32(36, imagePages);
+    write32(40, heapBytes / 4096);
+    write32(44, heapBytes / 4096);
+    write32(100, physicalPages - 1);
     ctx.r3.u64 = 0;
 }
 PPC_FUNC(__imp__MmQueryAllocationSize) {
@@ -526,6 +729,43 @@ PPC_FUNC(__imp__MmQueryAllocationSize) {
     (void)addr;
     ctx.r3.u64 = 0;
 }
+// The title's large pools (its main heap among them) come from here. The weak
+// stub answered 0, so every pool was built at guest address 0: the low-memory
+// reads, the allocator handing back address 4 and the loader's garbage counts
+// on the console (2026-10-24) all followed from it. The page-size windows and
+// rounding are runtime/native/kernel.cpp's; each window is a bump allocator,
+// as the rest of this bridge's heap is, and the console's guest space is one
+// committed mapping, so the addresses need no further mapping.
+PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx) {
+    KTRACE();
+    const uint32_t size = ctx.r4.u32, protection = ctx.r5.u32, alignment = ctx.r8.u32;
+    const uint32_t page = (protection & 0x20000000) ? 65536 : (protection & 0x80000000) ? 0x1000000 : 4096;
+    const uint32_t region = (page == 65536) ? 0xa0000000u : (page == 0x1000000) ? 0xc0000000u : 0xe0000000u;
+    const uint64_t limit = region == 0xe0000000u ? 0xffd00000ull : uint64_t(region) + 0x20000000;
+    const uint64_t rounded = (uint64_t(size) + page - 1) & ~uint64_t(page - 1);
+    uint64_t aligned = ((uint64_t(alignment) + page - 1) / page) * page;
+    if (aligned < page) aligned = page;
+    if (!size || rounded > 0x20000000 || aligned > 0x20000000) { ctx.r3.u64 = 0; return; }
+    static uint64_t next[3] = {0xa0000000ull, 0xc0000000ull, 0xe0000000ull};
+    uint64_t& cursor = next[region == 0xa0000000u ? 0 : region == 0xc0000000u ? 1 : 2];
+    uint32_t address = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
+        const uint64_t start = (cursor + aligned - 1) & ~(aligned - 1);
+        if (start + rounded <= limit) {
+            address = uint32_t(start);
+            cursor = start + rounded;
+        }
+    }
+    if (address) memset(base + address, 0, size_t(rounded));
+    std::fprintf(stderr, "[Memory] physical allocation size=0x%X page=0x%X address=0x%08X\n", size, page, address);
+    ctx.r3.u64 = address;
+}
+PPC_FUNC(__imp__MmFreePhysicalMemory) {
+    KTRACE();
+    // Bump windows: a pool's range stays reserved for the session.
+}
+
 PPC_FUNC(__imp__MmGetPhysicalAddress) {
     KTRACE();
     // Identity-map virtual->physical for bring-up.
@@ -611,32 +851,52 @@ PPC_FUNC(__imp__ExGetXConfigSetting) {
     ctx.r3.u64 = 0; // STATUS_SUCCESS
 }
 
+// The render-driver calls below are the whole of the guest's audio path: the
+// engine registers a callback, then submits 256-frame planar 6-channel float
+// grains through it. Windows hands that to XAudio2 (runtime/native/audio_driver).
+// The console hands it to the SceAudioOut puller (runtime/native/audio_ps5_driver).
 PPC_FUNC(__imp__XAudioRegisterRenderDriverClient) {
     KTRACE();
+#if defined(_WIN32)
     uint32_t pDriver = ctx.r4.u32;
     if (pDriver) {
         *reinterpret_cast<uint32_t*>(base + pDriver) = _byteswap_ulong(0x44415544); // 'DAUD'
     }
     ctx.r3.u64 = 0;
+#else
+    ctx.r3.u64 = DarkRecomp::Native::Ps5AudioDriver::registerClient(ctx.r3.u32, ctx.r4.u32);
+#endif
 }
 
 PPC_FUNC(__imp__XAudioUnregisterRenderDriverClient) {
     KTRACE();
+#if defined(_WIN32)
     ctx.r3.u64 = 0;
+#else
+    ctx.r3.u64 = DarkRecomp::Native::Ps5AudioDriver::unregisterClient(ctx.r3.u32);
+#endif
 }
 
 PPC_FUNC(__imp__XAudioSubmitRenderDriverFrame) {
     KTRACE();
+#if defined(_WIN32)
     ctx.r3.u64 = 0;
+#else
+    ctx.r3.u64 = DarkRecomp::Native::Ps5AudioDriver::submitFrame(ctx.r3.u32, ctx.r4.u32);
+#endif
 }
 
 PPC_FUNC(__imp__XAudioGetVoiceCategoryVolumeChangeMask) {
     KTRACE();
+#if defined(_WIN32)
     uint32_t pMask = ctx.r4.u32;
     if (pMask) {
         *reinterpret_cast<uint32_t*>(base + pMask) = 0;
     }
     ctx.r3.u64 = 0;
+#else
+    ctx.r3.u64 = DarkRecomp::Native::Ps5AudioDriver::voiceCategoryVolumeChangeMask(ctx.r3.u32, ctx.r4.u32);
+#endif
 }
 
 PPC_FUNC(__imp__XamGetSystemVersion) {
@@ -687,7 +947,8 @@ PPC_FUNC(__imp__XamInputGetState) {
         return;
     }
 
-    // 2. Keyboard & Mouse Fallback for Player 1
+    // 2. Keyboard & Mouse Fallback for Player 1 (Windows only; PS5 reads the pad directly)
+#if defined(_WIN32)
     if (userIndex == 0) {
         static uint32_t s_packetNum = 1;
         uint16_t buttons = 0;
@@ -724,6 +985,7 @@ PPC_FUNC(__imp__XamInputGetState) {
         ctx.r3.u64 = 0;
         return;
     }
+#endif
 
     ctx.r3.u64 = 1167; // ERROR_DEVICE_NOT_CONNECTED
 }
@@ -761,7 +1023,7 @@ PPC_FUNC(__imp__DbgPrint) {
             char tmp[96] = {};
             size_t pos = 0;
             for (size_t i = 0; i < 32 && pos < sizeof(tmp) - 4; i++) {
-                int n = sprintf_s(tmp + pos, sizeof(tmp) - pos, " %02X", (base + strPtr)[i]);
+                int n = snprintf(tmp + pos, sizeof(tmp) - pos, " %02X", (base + strPtr)[i]);
                 if (n < 0) break;
                 pos += (size_t)n;
             }
@@ -1043,6 +1305,19 @@ PPC_FUNC(__imp__ExTerminateThread) {
     ExitThread(ctx.r3.u32);
 }
 
+// Bring-up overrides of the game's own functions (the PPC_BYPASS below).
+// They were written while MmAllocatePhysicalMemoryEx answered 0 and the title's
+// heap was built at guest address 0: its trees read as zeroed or cyclic, so the
+// allocators, list leaves and delays that walked them were cut short here. With
+// the heap in real memory the shortcuts break the title instead (the stream
+// setup sub_8220B5B0 skipped, a loader spinning on GameContext_Create.XDF,
+// 2026-10-24), so the game's own code runs unless they are asked for.
+#if defined(DARK_BRINGUP_BYPASSES)
+#define PPC_BYPASS(x) PPC_FUNC(x)
+#else
+#define PPC_BYPASS(x) [[maybe_unused]] static void x##_bringupBypass(PPCContext& __restrict ctx, uint8_t* base)
+#endif
+
 // 6. Starbreeze CDisplayContext Factory Hook (0x822432D8)
 // ABI NOTE (2026-09-03): The guest is 32-bit big-endian PPC; the host is
 // 64-bit x86_64. We MUST NOT return a truncated host pointer in r3. Instead we
@@ -1055,7 +1330,7 @@ PPC_FUNC(__imp__ExTerminateThread) {
 static DarkRecomp::CDisplayContextD3D11* g_pNativeDisplay = nullptr;
 static std::unordered_map<uint32_t, DarkRecomp::CDisplayContextD3D11*> g_displayMap;
 
-PPC_FUNC(sub_822432D8) {
+PPC_BYPASS(sub_822432D8) {
     KTRACE();
     // Original: malloc(4768) + construct CDisplayContextXenon.
     // Native: allocate 4768 bytes from the guest heap so guest code can do
@@ -1086,7 +1361,7 @@ PPC_FUNC(sub_822432D8) {
 // return 0 ("not found") so the caller falls through instead of hanging.
 // This is a bring-up bypass, not a final heap implementation.
 static uint64_t g_heapHookLogged = 0;
-PPC_FUNC(sub_821080E8) {
+PPC_BYPASS(sub_821080E8) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1109,7 +1384,7 @@ PPC_FUNC(sub_821080E8) {
 // and KeDelay is zeroed, so the 14-min livelock it once had should now be
 // fast while doing the real per-entry work. Hot path: lock-free counter.
 static volatile LONG64 g_hook1F0B20Count = 0;
-PPC_FUNC(sub_821F0B20) {
+PPC_BYPASS(sub_821F0B20) {
     LONG64 n = InterlockedIncrement64(&g_hook1F0B20Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_821F0B20 passthrough #" << n
@@ -1123,7 +1398,7 @@ PPC_FUNC(sub_821F0B20) {
 // workers for determinism, so the first unsatisfied wait launches them for
 // real, then runs the original wait. Hot path: lock-free counter.
 static volatile LONG64 g_hook0C88B0Count = 0;
-PPC_FUNC(sub_820C88B0) {
+PPC_BYPASS(sub_820C88B0) {
     LONG64 n = InterlockedIncrement64(&g_hook0C88B0Count);
     uint32_t job = ctx.r3.u32;
     uint32_t completion = 0;
@@ -1147,7 +1422,7 @@ PPC_FUNC(sub_820C88B0) {
 // log only (PPCContext carries volatile regs; the sweep's table base is in
 // non-volatiles). Tells whether the sweep returns or itself is the stall.
 static volatile LONG64 g_hook9FEF8Count = 0;
-PPC_FUNC(sub_8289FEF8) {
+PPC_BYPASS(sub_8289FEF8) {
     LONG64 n = InterlockedIncrement64(&g_hook9FEF8Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_8289FEF8 sweep enter #" << n << std::endl;
@@ -1165,7 +1440,7 @@ PPC_FUNC(sub_8289FEF8) {
 // (ctr=0 -> lookup wraps to host 0x7E990000). Hook it to return fresh
 // zeroed guest memory so construction can proceed.
 static uint64_t g_heap7EA0Logged = 0;
-PPC_FUNC(sub_82107EA0) {
+PPC_BYPASS(sub_82107EA0) {
     uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32;
     // Heuristic: size is max(r3,r4) clamped to [32, 65536]; the observed
     // calls use r4 as size (0x60/0xE8/0x400) with r3 as heap handle.
@@ -1227,7 +1502,7 @@ static uint32_t AllocGuestHeap(uint8_t* base, uint32_t size, const char* who, ui
     memset(base + guestObj, 0, size);
     return guestObj;
 }
-PPC_FUNC(sub_82215978) {
+PPC_BYPASS(sub_82215978) {
     uint32_t size = ctx.r4.u32;
     uint32_t guestObj = AllocGuestHeap(base, size, "82215978", &g_heap2215978Logged);
     if (g_heap2215978Logged <= 5) {
@@ -1239,7 +1514,7 @@ PPC_FUNC(sub_82215978) {
     ctx.r3.u64 = guestObj;
 }
 static uint64_t g_heap2216628Logged = 0;
-PPC_FUNC(sub_82216628) {
+PPC_BYPASS(sub_82216628) {
     uint32_t size = ctx.r4.u32;
     uint32_t guestObj = AllocGuestHeap(base, size, "82216628", &g_heap2216628Logged);
     if (g_heap2216628Logged <= 5) {
@@ -1255,7 +1530,7 @@ PPC_FUNC(sub_82216628) {
 // FCF8(10) which calls FBB8 again -> infinite mutual recursion -> host stack
 // overflow. Hook it to return fresh guest memory (size in r3).
 static uint64_t g_heap1EFDA8Logged = 0;
-PPC_FUNC(sub_821EFDA8) {
+PPC_BYPASS(sub_821EFDA8) {
     uint32_t size = ctx.r3.u32;
     if (size == 0) size = 28;
     uint32_t guestObj = AllocGuestHeap(base, size, "821EFDA8", &g_heap1EFDA8Logged);
@@ -1274,7 +1549,7 @@ PPC_FUNC(sub_821EFDA8) {
 // 0x82007898) and faults under .rdata protection (or corrupts silently
 // without it). Hook as safe calloc: clamp total, allocate, zero exactly that.
 static uint64_t g_heap1FCBD0Logged = 0;
-PPC_FUNC(sub_821FCBD0) {
+PPC_BYPASS(sub_821FCBD0) {
     uint64_t count = ctx.r3.u32, esize = ctx.r4.u32;
     uint64_t total = count * (esize ? esize : 1);
     if (total == 0) total = 64;
@@ -1297,7 +1572,7 @@ PPC_FUNC(sub_821FCBD0) {
 }
 // sub_8289FCF8 is the heap-table lookup (index in r3) that recurses into
 static uint64_t g_hookFCF8Logged = 0;
-PPC_FUNC(sub_8289FCF8) {
+PPC_BYPASS(sub_8289FCF8) {
     uint64_t n = 0;
     uint32_t guestObj = 0;
     {
@@ -1321,7 +1596,7 @@ PPC_FUNC(sub_8289FCF8) {
 // Bypass for now (return 1 = success) so _xstart can proceed to file and
 // display stages where the native port work actually lives.
 static uint64_t g_hook89C658Logged = 0;
-PPC_FUNC(sub_8289C658) {
+PPC_BYPASS(sub_8289C658) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1338,7 +1613,7 @@ PPC_FUNC(sub_8289C658) {
 // left by heap bypasses (zeroed objects, no constructed sentinels).
 // Bypass for bring-up (log object, return it) so init can reach display.
 static uint64_t g_hook23C4D0Logged = 0;
-PPC_FUNC(sub_8223C4D0) {
+PPC_BYPASS(sub_8223C4D0) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1354,7 +1629,7 @@ PPC_FUNC(sub_8223C4D0) {
 // sub_8223C1A8: sibling list primitive faulting on static heads in the
 // protected .rdata/.pdata window (guest 0x8209FFE8). Same bypass.
 static uint64_t g_hook23C1A8Logged = 0;
-PPC_FUNC(sub_8223C1A8) {
+PPC_BYPASS(sub_8223C1A8) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1369,7 +1644,7 @@ PPC_FUNC(sub_8223C1A8) {
 // sub_82267040: display-construction list leaf (via 82241200 ctor).
 // Same tagged-pointer pattern, same protected-head fault (0x8209FFF0).
 static uint64_t g_hook267040Logged = 0;
-PPC_FUNC(sub_82267040) {
+PPC_BYPASS(sub_82267040) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1383,7 +1658,7 @@ PPC_FUNC(sub_82267040) {
 }
 // sub_822672F0: next sibling list leaf (fault 0x8209FFF8, +8 past 67040).
 static uint64_t g_hook2672F0Logged = 0;
-PPC_FUNC(sub_822672F0) {
+PPC_BYPASS(sub_822672F0) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1397,7 +1672,7 @@ PPC_FUNC(sub_822672F0) {
 }
 // sub_8220B2F8: resource-init list leaf via 82104DC8 (fault 0x8209FFB4).
 static uint64_t g_hook20B2F8Logged = 0;
-PPC_FUNC(sub_8220B2F8) {
+PPC_BYPASS(sub_8220B2F8) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1412,7 +1687,7 @@ PPC_FUNC(sub_8220B2F8) {
 // sub_82214ED0: heap RB-tree find-or-create spinning on cyclic metadata
 // (watchdog: endless tree walk, no crash). Hook to return a fresh node.
 static uint64_t g_hook214ED0Logged = 0;
-PPC_FUNC(sub_82214ED0) {
+PPC_BYPASS(sub_82214ED0) {
     uint64_t n = 0;
     uint32_t guestObj = 0;
     {
@@ -1432,7 +1707,7 @@ PPC_FUNC(sub_82214ED0) {
 }
 // sub_8223B9A8: resource list leaf via 82104DC8 (fault 0x82055640, .rdata).
 static uint64_t g_hook23B9A8Logged = 0;
-PPC_FUNC(sub_8223B9A8) {
+PPC_BYPASS(sub_8223B9A8) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1449,7 +1724,7 @@ PPC_FUNC(sub_8223B9A8) {
 // (same trap as 82216270). Try original under SEH; fresh node on fault.
 static volatile LONG64 g_hook214030Count = 0;
 static volatile LONG64 g_hook214030Faults = 0;
-PPC_FUNC(sub_82214030) {
+PPC_BYPASS(sub_82214030) {
     LONG64 n = InterlockedIncrement64(&g_hook214030Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_82214030 try-original #" << n
@@ -1489,7 +1764,7 @@ static volatile LONG64 g_hook216088Count = 0;
 // exit (heap 0x145a9000); try-original/native regressed to early hangs.
 // Restore bypass: return a fresh zeroed node so callers advance.
 static uint64_t g_hook216088Logged = 0;
-PPC_FUNC(sub_82216088) {
+PPC_BYPASS(sub_82216088) {
     LONG64 n = InterlockedIncrement64(&g_hook216088Count);
     uint32_t heap = ctx.r3.u32, key = ctx.r4.u32, r5 = ctx.r5.u32;
     uint32_t guestObj = AllocGuestHeap(base, 256, "82216088", &g_hook216088Logged);
@@ -1506,7 +1781,7 @@ PPC_FUNC(sub_82216088) {
 // Restore fresh-node bypass.
 static volatile LONG64 g_hook216270Count = 0;
 static uint64_t g_hook216270Logged = 0;
-PPC_FUNC(sub_82216270) {
+PPC_BYPASS(sub_82216270) {
     LONG64 n = InterlockedIncrement64(&g_hook216270Count);
     uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;
     uint32_t guestObj = AllocGuestHeap(base, 256, "82216270", &g_hook216270Logged);
@@ -1520,7 +1795,7 @@ PPC_FUNC(sub_82216270) {
 }
 // sub_8220B5B0: game-world list leaf via 82104DC8 (fault in .rdata window).
 static uint64_t g_hook20B5B0Logged = 0;
-PPC_FUNC(sub_8220B5B0) {
+PPC_BYPASS(sub_8220B5B0) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1537,7 +1812,7 @@ PPC_FUNC(sub_8220B5B0) {
 // Bypass (no touch) so the caller takes its fail path instead of faulting
 // one-past the guest mapping.
 static uint64_t g_hook20D168Logged = 0;
-PPC_FUNC(sub_8220D168) {
+PPC_BYPASS(sub_8220D168) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1553,7 +1828,7 @@ PPC_FUNC(sub_8220D168) {
 // (watchdog: static heap, same RSP/RIP window minutes-long). Bypass leaving
 // regs unchanged so caller 82104DC8 continues to display/file stages.
 static uint64_t g_hook2062B8Logged = 0;
-PPC_FUNC(sub_822062B8) {
+PPC_BYPASS(sub_822062B8) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1571,7 +1846,7 @@ PPC_FUNC(sub_822062B8) {
 // NOTE: hot path (per-node during traversal): lock-free counter, no mutex,
 // to avoid contending with the very traversal being bypassed.
 static volatile LONG64 g_hook2181C0Count = 0;
-PPC_FUNC(sub_822181C0) {
+PPC_BYPASS(sub_822181C0) {
     LONG64 n = InterlockedIncrement64(&g_hook2181C0Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_822181C0 bypass #" << n
@@ -1583,7 +1858,7 @@ PPC_FUNC(sub_822181C0) {
 // code with cycle breaking (see t_152C8Depth).
 static volatile LONG64 g_hook2152C8Count = 0;
 static thread_local int t_152C8Depth = 0;
-PPC_FUNC(sub_822152C8) {
+PPC_BYPASS(sub_822152C8) {
     LONG64 n = InterlockedIncrement64(&g_hook2152C8Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_822152C8 bypass #" << n
@@ -1604,7 +1879,7 @@ PPC_FUNC(sub_822152C8) {
 // sub_821EFC78: find-type lookup livelocked 15min (same window Offsets,
 // heap static). Return a fresh node like the other find hooks.
 static volatile LONG64 g_hook1EFC78Count = 0;
-PPC_FUNC(sub_821EFC78) {
+PPC_BYPASS(sub_821EFC78) {
     LONG64 n = InterlockedIncrement64(&g_hook1EFC78Count);
     uint32_t guestObj = 0;
     {
@@ -1631,7 +1906,7 @@ PPC_FUNC(sub_821EFC78) {
 // Bypass so 82104DC8 advances; resource requests then miss to disk streaming
 // (file bridge handles opens/reads) instead of spinning the registry.
 static volatile LONG64 g_hook21F27D0Count = 0;
-PPC_FUNC(sub_821F27D0) {
+PPC_BYPASS(sub_821F27D0) {
     LONG64 n = InterlockedIncrement64(&g_hook21F27D0Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_821F27D0 bypass #" << n
@@ -1643,7 +1918,7 @@ PPC_FUNC(sub_821F27D0) {
 // +0x2d3 window, heap static). Bypass leaving regs unchanged so caller
 // 82241618 continues toward present/file stages. Hot path: lock-free.
 static volatile LONG64 g_hook243710Count = 0;
-PPC_FUNC(sub_82243710) {
+PPC_BYPASS(sub_82243710) {
     LONG64 n = InterlockedIncrement64(&g_hook243710Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_82243710 bypass #" << n
@@ -1656,7 +1931,7 @@ PPC_FUNC(sub_82243710) {
 // instead so the caller advances (faults downstream get hooked as usual).
 // Hot path: lock-free counter.
 static volatile LONG64 g_hook216B98Count = 0;
-PPC_FUNC(sub_82216B98) {
+PPC_BYPASS(sub_82216B98) {
     LONG64 n = InterlockedIncrement64(&g_hook216B98Count);
     // Memoize on (r3,r4): the caller retries identical lookups hundreds of
     // thousands of times; fresh allocs per retry exploded the heap through
@@ -1698,7 +1973,7 @@ PPC_FUNC(sub_82216B98) {
 // 822152C8 (indexes result-1/-4 -> one-past-end fault); it never null-checks
 // because on hardware these indices always hit. Return a fresh node instead.
 static volatile LONG64 g_hook0CA1F8Count = 0;
-PPC_FUNC(sub_820CA1F8) {
+PPC_BYPASS(sub_820CA1F8) {
     LONG64 n = InterlockedIncrement64(&g_hook0CA1F8Count);
     uint32_t guestObj = 0;
     {
@@ -1719,7 +1994,7 @@ PPC_FUNC(sub_820CA1F8) {
 // sub_8223A7D8: resource-chain leaf faulting with -1-derived dest (same
 // pattern via 822062B8). Bypass.
 static uint64_t g_hook23A7D8Logged = 0;
-PPC_FUNC(sub_8223A7D8) {
+PPC_BYPASS(sub_8223A7D8) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1735,7 +2010,7 @@ PPC_FUNC(sub_8223A7D8) {
 // family; on empty queue it should return null so the worker waits instead
 // of faulting. Return 0.
 static uint64_t g_hook1FD6D8Logged = 0;
-PPC_FUNC(sub_821FD6D8) {
+PPC_BYPASS(sub_821FD6D8) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1751,7 +2026,7 @@ PPC_FUNC(sub_821FD6D8) {
 // sub_8210C138: content-load list leaf writing to image base (0x82000000).
 // Same family as 8223B9A8/8220B5B0; bypass.
 static uint64_t g_hook10C138Logged = 0;
-PPC_FUNC(sub_8210C138) {
+PPC_BYPASS(sub_8210C138) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1768,7 +2043,7 @@ PPC_FUNC(sub_8210C138) {
 // hardware these indices always hit. Return a fresh node like the other
 // find-type hooks so callers advance (faults downstream get hooked).
 static volatile LONG64 g_hook250B88Count = 0;
-PPC_FUNC(sub_82250B88) {
+PPC_BYPASS(sub_82250B88) {
     LONG64 n = InterlockedIncrement64(&g_hook250B88Count);
     uint32_t guestObj = 0;
     {
@@ -1790,7 +2065,7 @@ PPC_FUNC(sub_82250B88) {
 // empty job queue at ~500k/sec each). Throttle with Sleep(1) and skip the
 // assert so workers idle cleanly until main queues real work.
 static uint64_t g_hook20DC10Logged = 0;
-PPC_FUNC(sub_8220DC10) {
+PPC_BYPASS(sub_8220DC10) {
     uint64_t n = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(g_kernelMutex);
@@ -1814,7 +2089,7 @@ PPC_FUNC(sub_8220DC10) {
 // 8289C410 (3 misses, early init) and 8275CE18 (leaf, 1-2 misses) likewise
 // left alone.
 static volatile LONG64 g_hook27A72D8Count = 0;
-PPC_FUNC(sub_827A72D8) {
+PPC_BYPASS(sub_827A72D8) {
     LONG64 n = InterlockedIncrement64(&g_hook27A72D8Count);
     if (n <= 3) {
         char buf[128];
@@ -1835,7 +2110,7 @@ PPC_FUNC(sub_827A72D8) {
 // null ("never constructed") or heap garbage ("wrong heap"/stale link)? All
 // guest reads are SEH-guarded; on fault we still run the original.
 static volatile LONG64 g_hook21F35F8Count = 0;
-PPC_FUNC(sub_821F35F8) {
+PPC_BYPASS(sub_821F35F8) {
     LONG64 n = InterlockedIncrement64(&g_hook21F35F8Count);
     if (n <= 3 || (n % 20000) == 0) {
         uint32_t obj = ctx.r3.u32, r4 = ctx.r4.u32;
@@ -1883,7 +2158,7 @@ PPC_FUNC(sub_821F35F8) {
 // overlapping the protected image window, clamp absurd sizes, else host
 // memset (fast path for legitimate object clears).
 static uint64_t g_memsetSkipLogged = 0;
-PPC_FUNC(sub_82899950) {
+PPC_BYPASS(sub_82899950) {
     uint32_t dest = ctx.r3.u32;
     uint8_t val = (uint8_t)(ctx.r4.u32 & 0xFF);
     uint32_t size = ctx.r5.u32;
@@ -1911,7 +2186,7 @@ PPC_FUNC(sub_82899950) {
 // Survey 1/3/4 proved pure bypass reaches clean _xstart; try-original hangs
 // in 82207850/820C88B0 spin. Restore bypass (leave regs, let caller advance).
 static volatile LONG64 g_hook10A738Count = 0;
-PPC_FUNC(sub_8210A738) {
+PPC_BYPASS(sub_8210A738) {
     LONG64 n = InterlockedIncrement64(&g_hook10A738Count);
     if (n <= 5) {
         std::cout << "[Hook] sub_8210A738 bypass #" << n
@@ -1925,7 +2200,7 @@ PPC_FUNC(sub_8210A738) {
 // needed the delay use it as pacing; bring-up needs progress, not pacing).
 // Hot path: lock-free.
 static volatile LONG64 g_hook28AC000Count = 0;
-PPC_FUNC(sub_828AC000) {
+PPC_BYPASS(sub_828AC000) {
     LONG64 n = InterlockedIncrement64(&g_hook28AC000Count);
     if (n <= 3) {
         std::cout << "[Hook] sub_828AC000 bypass #" << n
@@ -1951,7 +2226,15 @@ PPC_FUNC(__imp__NtCreateFile) {
 
 PPC_FUNC(__imp__NtReadFile) {
     KTRACE();
+    // The read completes before it returns, so its event (r4) is signaled
+    // now, as the Windows runtime does on completion: a guest that waits on
+    // it would otherwise wait for a read that already happened.
+    const uint32_t event = ctx.r4.u32;
     DarkRecomp::Hook_NtReadFile(ctx, base);
+    if (event) {
+        HANDLE host = FindKernelHandle(event);
+        if (host) SetEvent(host);
+    }
 }
 
 PPC_FUNC(__imp__NtReadFileScatter) {

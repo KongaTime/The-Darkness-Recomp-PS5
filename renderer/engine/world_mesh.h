@@ -6,6 +6,17 @@
 #include <string_view>
 
 namespace DarkRecomp::Native {
+// PS5 diagnostic A/B control. Plans describe only which owned constants to
+// process; no constant values or guest-memory observations are cached.
+inline std::atomic<bool> vertexProgramPlansEnabled{false};
+inline std::atomic<bool> vertexProgramPlansSafe{true};
+inline std::atomic<uint64_t> vertexProgramPlanLookups{},vertexProgramPlanHits{};
+// Opt-in direct preparation from the committed PS5 guest bank. A mismatch
+// latches safety off until process exit, independently of the file controls.
+inline std::atomic<bool> nativeWorldCaptureEnabled{false},nativeWorldCaptureCompare{false},nativeWorldCaptureSafe{true};
+struct NativeWorldCaptureStats {uint64_t attempts{},captured{},fallbacks{},mismatches{};};
+NativeWorldCaptureStats nativeWorldCaptureStats() noexcept;
+void rejectNativeWorldCaptureComparison() noexcept;
 // A completed native GPU measurement, shared across producer/consumer threads.
 // UINT64_MAX denotes unavailable; zero is a real measured result.
 struct WorldQueryResult {std::atomic<uint64_t> samples{UINT64_MAX};};
@@ -25,6 +36,21 @@ struct WorldVertexOptions {
 struct WorldVertexConstants {
     std::array<EngineVector,256> vectors{};
     std::array<std::array<uint32_t,4>,9> references{};
+    // One bit per vector the preparation wrote; every other vector is zero.
+    // A superset is always safe. All zero means unknown: treat every vector as
+    // written. Lets a consumer compare two banks by their written vectors only.
+    std::array<uint64_t,4> written{};
+    void markWritten(unsigned first, unsigned count) noexcept {
+        if (first >= 256 || !count) return;
+        const unsigned end = first + (count < 256-first ? count : 256-first);
+        while (first < end) {
+            const unsigned word = first / 64, low = first % 64;
+            const unsigned stop = end < (word+1)*64 ? end : (word+1)*64;
+            const unsigned high = stop - word*64;
+            written[word] |= (UINT64_MAX << low) & (high == 64 ? UINT64_MAX : (uint64_t(1) << high)-1);
+            first = stop;
+        }
+    }
 };
 enum class WorldMaterial { depth, motion, ndsp, fixed, post };
 struct WorldTexture {
@@ -87,10 +113,21 @@ struct WorldClipPlanes {
     uint32_t enabledMask() const noexcept {return (control&0x10000u)?0u:control&63u;}
     bool cullOnly() const noexcept {return (control&0x20000u)!=0;}
 };
+class QueuedWorldDrawAccess;
 struct WorldDraw : WorldSurfaceTargets {
+private:
+    friend class QueuedWorldDrawAccess;
+    struct QueueOwnership {
+        bool value=false;
+        QueueOwnership() = default;
+        QueueOwnership(const QueueOwnership&) noexcept {}
+        QueueOwnership(QueueOwnership&&) noexcept {}
+        QueueOwnership& operator=(const QueueOwnership&) noexcept {value=false;return *this;}
+        QueueOwnership& operator=(QueueOwnership&&) noexcept {value=false;return *this;}
+    } queueOwnership_;
+public:
     WorldGeometry geometry;
     WorldVertexOptions options;
-    WorldVertexConstants constants;
     std::array<uint8_t,160> attributes{};
     std::array<uint32_t,4> viewport{};
     WorldMaterial material = WorldMaterial::depth;
@@ -98,8 +135,6 @@ struct WorldDraw : WorldSurfaceTargets {
     uint32_t fragmentFlags=0;
     EngineVector depthRange{0,1,0,0};
     WorldClipPlanes clipPlanes;
-    // Lit projected decals use env[0..33]; retain the complete supported bank.
-    std::array<EngineVector,64> fragmentConstants{};
     std::array<uint16_t,16> textureIds{};
     uint16_t textureMask=0xFFFF; // Conservative original-source usage; manual draws retain all slots.
     std::array<WorldTexture,16> textureObjects{};
@@ -107,6 +142,10 @@ struct WorldDraw : WorldSurfaceTargets {
     std::array<std::shared_ptr<const ColorImage>,16> textures{};
     PromptRenderContext promptContext = PromptRenderContext::Menu;
     bool subtitle = false;
+    // Keep frequently read metadata together, ahead of the larger banks.
+    WorldVertexConstants constants;
+    // Lit projected decals use env[0..33]; retain the complete supported bank.
+    std::array<EngineVector,64> fragmentConstants{};
 };
 uint16_t worldFragmentTextureMask(std::string_view name,uint32_t flags) noexcept;
 struct WorldResolve : WorldSurfaceTargets {
@@ -205,8 +244,21 @@ bool snapshotWorldDraw(uint8_t* base, const StoredDraw&, WorldDraw&) noexcept;
 std::shared_ptr<WorldDraw> captureWorldDraw(uint8_t* base,const StoredDraw&) noexcept;
 // Consume only the geometry references, and only after successful capture.
 std::shared_ptr<WorldDraw> captureWorldDraw(uint8_t* base,StoredDraw&&) noexcept;
+std::shared_ptr<WorldDraw> captureWorldDrawCanonical(uint8_t*,const StoredDraw&) noexcept;
+std::shared_ptr<WorldDraw> captureNativeWorldDraw(uint8_t* base,StoredDraw&) noexcept;
+bool equivalentWorldCaptures(const WorldDraw&,const WorldDraw&) noexcept;
+#if defined(DARK_TEST_NATIVE_CAPTURE)
+inline thread_local void (*nativeCaptureBeforeValidation)(uint8_t*)=nullptr;
+inline thread_local void (*nativeCaptureAfterValidation)(WorldDraw&)=nullptr;
+std::shared_ptr<WorldDraw> testCaptureNativeBinding(uint8_t*,const EngineVertexBindingState&,const StoredDraw&) noexcept;
+#endif
+inline std::atomic<bool> selectiveWorldDrawReset{false}, selectiveWorldDrawResetSafe{true};
+inline std::atomic<uint64_t> worldVertexResetBytesSaved{0};
 bool snapshotWorldClear(uint8_t* base,uint32_t device,uint32_t flags,uint32_t color,
                         float depth,uint32_t stencil,WorldClear&) noexcept;
 void printWorldCounters();
+// Skinned draws that reused a proven palette against those that had to walk
+// their vertex influences; a live run needs this while it is still rendering.
+void printWorldPaletteProofCounters();
 void recordWorldSubmission(WorldMaterial material);
 }

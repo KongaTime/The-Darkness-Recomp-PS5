@@ -483,7 +483,7 @@ bool cachedLogicalRead(PPCContext& ctx, uint8_t* base) {
         if (guestSpan(base, context + 88, 1, true)) PPC_STORE_U8(context + 88, 0);
         ctx.r3.u64 = 0;
         std::fprintf(stderr, "[Weapons] Logical read failed '%ls' offset=%llu bytes=%u: %s.\n",
-            file->path.filename().c_str(), position, requested, reason);
+            file->path.filename().wstring().c_str(), position, requested, reason);
     };
     // The original logical reader updates these counters only after memcpy,
     // and sets byte +88 to zero if its read buffer cannot supply the bytes.

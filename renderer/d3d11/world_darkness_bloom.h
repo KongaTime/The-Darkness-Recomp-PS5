@@ -8,14 +8,18 @@ namespace DarkRecomp {
 // This is a visual calibration, not an extra multiplier from the Xbox shader.
 inline Native::EngineVector darknessArmBloomColor(const Native::WorldDraw& draw,bool bloom) {
     auto color=draw.fragmentConstants[0];
-    if(!bloom || draw.fragmentName!="XRUtil_RenderSurface" || draw.fragmentFlags)
-        return color;
+    if(!bloom) return color;
+    // Cheapest discriminating guards first. Only five shipped images reach the
+    // program-name test at all, so the per-draw string compare that used to run
+    // on every draw now runs on the handful of glow shells.
     const auto id=draw.textureIds[0];
     // Shipped cache: Sign_4, Sign_3, Sign_1, Sign_2 and Signs_Levels.
     if(id!=9187 && id!=9188 && id!=9189 && id!=9190 && id!=9192)
         return color;
     const auto& texture=draw.textureObjects[0];
     if(texture.format!=20 || texture.width!=512 || texture.height!=512 || texture.faces!=1)
+        return color;
+    if(draw.fragmentName!="XRUtil_RenderSurface" || draw.fragmentFlags)
         return color;
     const auto* a=draw.attributes.data();
     const uint32_t flags=uint32_t(a[92])<<24|uint32_t(a[93])<<16|uint32_t(a[94])<<8|a[95];

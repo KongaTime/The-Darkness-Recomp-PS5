@@ -1,4 +1,5 @@
 #pragma once
+#include "render_memory.h"
 #include <array>
 #include <algorithm>
 #include <bit>
@@ -125,10 +126,6 @@ struct SimpleMesh {
 };
 
 namespace Native {
-bool copyRenderMemory(uint8_t* base, uint64_t address, void* output, size_t size);
-// Compare an owned snapshot with the current readable bytes. A mismatch or
-// inaccessible range fails; no second temporary copy of the bank is needed.
-bool equalRenderMemory(uint8_t* base, uint64_t address, const void* expected, size_t size);
 // Exact 68-byte CPU vertex descriptor consumed by original 8225CDD8.
 // This bounded subset accepts position/UV0/color; unsupported streams reject.
 const char* decodeSimpleMesh(uint8_t* base, uint32_t descriptor, uint32_t indices,
@@ -196,6 +193,9 @@ uint64_t promptOriginClassified();
 void previewObserveTriangles(uint8_t* base, uint32_t indices, uint32_t triangles);
 void previewObserveWorld(uint8_t* base,const StoredDraw&);
 void previewObserveWorld(uint8_t* base,StoredDraw&&);
+// Indexed hook with geometry retained but no intermediate owned constant bank.
+// The opt-in native path and every fallback finish capture before queue admission.
+void previewObserveWorldUnbound(uint8_t* base,StoredDraw&&);
 void previewObserveImmediateWorld(uint8_t* base,uint32_t device,uint32_t indices,uint32_t indexCount);
 void previewObserveClear(uint8_t* base,uint32_t device,uint32_t flags,uint32_t color,float depth,uint32_t stencil,const std::array<int32_t,4>& rectangle);
 // Output of original 8225F320 at the triangle draw call site in 8225DE78.
@@ -206,7 +206,7 @@ void previewEndFrame();
 // Disable before stopping the consumer to release a waiting producer.
 // Streaming bounds the live handoff without dropping the tail of a large
 // frame. Its consumer must request PreviewFramePart and present only last.
-void setPreviewFrameBackpressure(bool enabled,bool streamLargeFrames=false);
+void setPreviewFrameBackpressure(bool enabled,bool streamLargeFrames=false,unsigned bufferedParts=1);
 bool previewWorldActive();
 void previewObserveResolve(uint8_t*,uint32_t device,uint32_t flags,uint32_t rectangle,uint32_t destination,
                            uint32_t offset,uint32_t color,float depth,uint32_t stencil,uint32_t face,uint32_t mip);
@@ -226,7 +226,13 @@ bool previewReadFlare(unsigned id,uint64_t& samples);
 // adding another display-period delay. Zero retains nonblocking behavior.
 struct PreviewFramePart {bool first=true,last=true;};
 bool takePreviewFrame(std::vector<SimpleMesh>& frame,unsigned waitMilliseconds=0,PreviewFramePart* part=nullptr);
+// Destroy the consumer's finished parts on a worker thread rather than in
+// takePreviewFrame. Off by default; disabling joins the worker after it drains.
+void setPreviewBackgroundRetirement(bool enabled);
 void printPreviewCounters();
+// The two engine-thread counters a live frame-rate investigation needs, printed
+// without the full counter block.
+void printWorldCaptureCounters();
 void recordPreviewRender(size_t meshCount);
 }
 }

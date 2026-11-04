@@ -10,13 +10,14 @@
 #include "engine_palette.h"
 #include "engine_vertex_program.h"
 #include "world_mesh.h"
+#include "queued_world_draw.h"
 #include "frame_resource_set.h"
 #include "scene_work.h"
 #include "render_trace.h"
 #include "runtime/native/display_mode.h"
 #include "runtime/native/runtime.h"
 #include "runtime/native/stall_profiler.h"
-#include <windows.h>
+#include "runtime/native/windows_shim.h"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -27,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -80,10 +82,12 @@ std::mutex queueMutex;
 std::condition_variable frameConsumed,frameAvailable;
 bool frameBackpressure=false;
 bool streamLargeFrames=false,pendingFirst=true;
-PreviewFramePart readyPart;
+struct ReadyPreviewPart {std::vector<SimpleMesh> commands;PreviewFramePart part;};
+std::deque<ReadyPreviewPart> readyParts;
+unsigned readyPartLimit=1;
 // A live frame may contain many lighting passes. Bound the in-flight batch,
-// not the logical frame: producer, ready slot and consumer own at most one
-// batch each. Constants/commands are bounded by 512 entries; immutable world
+// not the logical frame: producer and consumer own one batch each, with a
+// bounded ready queue between them. Each batch has 512 entries; immutable world
 // buffers and images have independent byte limits and are charged once.
 constexpr size_t livePartCommands=512,worldGeometryByteLimit=64*1024*1024;
 constexpr size_t worldImageByteLimit=256*1024*1024;
@@ -128,15 +132,100 @@ struct CachedVideo {
     std::shared_ptr<const VideoFrame> image;
 };
 std::unordered_map<uint32_t, CachedVideo> videos;
-std::vector<SimpleMesh> pending, ready, recycledFrame;
+std::vector<SimpleMesh> pending, recycledFrame;
 std::atomic<uint64_t> frameBufferReuses{};
-bool frameReady = false;
 size_t pendingVertices = 0, pendingWorldVertices=0;
 FrameResourceSet<StoredGeometry> pendingGeometry;
 size_t pendingGeometryBytes=0;
 FrameResourceSet<ColorImage> pendingWorldImages;
 size_t pendingWorldImageBytes=0,pendingGuiDraws=0;
 std::atomic<uint64_t> worldQueued{},worldVertexBudgetDrops{},worldCommandBudgetDrops{};
+// World image decodes the engine thread performs from the guest's textures.
+std::atomic<uint64_t> worldTextureDecodeAttempts{},worldTextureDecodeFailures{},worldTextureDecodeNanoseconds{};
+// Objects the engine resolved on the GPU. They are sampled through the
+// renderer's resolved view; their guest pixels are not a CPU-readable image, so
+// a decode of one reads every block of the surface only to fail. Remembering
+// which objects were resolved keeps that read off the engine thread.
+std::mutex resolvedObjectMutex;
+// A resolved address is trusted for a while, not forever: the engine frees and
+// reuses guest memory, and a recycled address may later hold a CPU texture.
+constexpr uint32_t resolvedObjectLifetimeFrames=900;
+struct ResolvedObject {uint32_t object=0,frames=0;};
+std::array<ResolvedObject,256> resolvedObjects{};
+size_t resolvedObjectCount=0;
+void recordResolvedObject(uint32_t object) {
+    if(!object)return;
+    const uint32_t now=uint32_t(frames.load(std::memory_order_relaxed));
+    std::lock_guard lock(resolvedObjectMutex);
+    for(size_t i=0;i<resolvedObjectCount;++i)
+        if(resolvedObjects[i].object==object) {resolvedObjects[i].frames=now;return;}
+    if(resolvedObjectCount<resolvedObjects.size())
+        resolvedObjects[resolvedObjectCount++]={object,now};
+    else {
+        std::move(resolvedObjects.begin()+1,resolvedObjects.end(),resolvedObjects.begin());
+        resolvedObjects.back()={object,now};
+    }
+}
+bool isResolvedObject(uint32_t object) {
+    if(!object)return false;
+    const uint32_t now=uint32_t(frames.load(std::memory_order_relaxed));
+    std::lock_guard lock(resolvedObjectMutex);
+    for(size_t i=0;i<resolvedObjectCount;++i)
+        if(resolvedObjects[i].object==object && now-resolvedObjects[i].frames<resolvedObjectLifetimeFrames)return true;
+    return false;
+}
+// Why the decode below repeats, as counters rather than a guess: a decode that
+// succeeds and is cached should not run again for the same resource next frame,
+// so cacheHits/installs/budgetRejects separate a cache that misses from one that
+// cannot hold the image. The window tally names the resources that repeat.
+std::atomic<uint64_t> worldTextureCacheHits{},worldTextureDecodeInstalls{};
+std::atomic<uint64_t> worldTextureDecodeRepeats{},worldTextureDecodeBudgetRejects{};
+std::atomic<uint64_t> worldTextureKeyClashes{};
+std::atomic<unsigned> worldTextureDecodeReasonsPrinted{};
+struct WindowDecodeTally {uint32_t object=0,id=0,count=0,width=0,height=0;};
+std::mutex windowDecodeMutex;
+std::array<WindowDecodeTally,64> windowDecodes{};
+size_t windowDecodeCount=0;
+// True when this object was already decoded in this window. Entries past the
+// table's capacity cannot be tallied, but they still count as installs.
+bool noteWindowDecode(uint32_t object,uint32_t id,uint32_t width,uint32_t height) {
+    std::lock_guard lock(windowDecodeMutex);
+    for(size_t i=0;i<windowDecodeCount;++i)
+        if(windowDecodes[i].object==object) {++windowDecodes[i].count;return true;}
+    if(windowDecodeCount<windowDecodes.size())
+        windowDecodes[windowDecodeCount++]={object,id,1,width,height};
+    return false;
+}
+// A failed decode is remembered per resource and mip for a second. Most of
+// them fail because the surface is not a CPU image at all; retrying every draw
+// of every frame re-reads the same blocks for the same answer.
+struct FailedWorldDecode {uint32_t object=0,mip=0,frames=0;};
+std::mutex failedDecodeMutex;
+std::array<FailedWorldDecode,128> failedWorldDecodes{};
+size_t failedWorldDecodeCount=0;
+bool worldDecodeRecentlyFailed(uint32_t object,unsigned mip) {
+    const uint32_t now=uint32_t(frames.load(std::memory_order_relaxed));
+    std::lock_guard lock(failedDecodeMutex);
+    for(size_t i=0;i<failedWorldDecodeCount;++i) {
+        auto& failed=failedWorldDecodes[i];
+        if(failed.object==object && failed.mip==mip && now-failed.frames<60)return true;
+    }
+    return false;
+}
+void recordWorldDecodeFailure(uint32_t object,unsigned mip) {
+    const uint32_t now=uint32_t(frames.load(std::memory_order_relaxed));
+    std::lock_guard lock(failedDecodeMutex);
+    for(size_t i=0;i<failedWorldDecodeCount;++i)
+        if(failedWorldDecodes[i].object==object && failedWorldDecodes[i].mip==mip) {
+            failedWorldDecodes[i].frames=now;return;
+        }
+    if(failedWorldDecodeCount<failedWorldDecodes.size())
+        failedWorldDecodes[failedWorldDecodeCount++]={object,mip,now};
+    else {
+        std::move(failedWorldDecodes.begin()+1,failedWorldDecodes.end(),failedWorldDecodes.begin());
+        failedWorldDecodes.back()={object,mip,now};
+    }
+}
 std::atomic<uint64_t> worldImageBudgetDrops{},streamedParts{};
 struct QueueFrameCounts {
     size_t worldDraws=0, commandDrops=0, vertexDrops=0, clearDrops=0, resolveDrops=0, guiDrops=0;
@@ -209,10 +298,10 @@ size_t textureBytes = 0;
 size_t pendingVideoBytes = 0;
 // Keep the faulting instructions inside a call covered by the SEH scope.
 // Clang may lower an intrinsic memcpy in __try to unprotected inline loads.
-__declspec(noinline) void copyEngineBytes(void* output,const void* input,size_t size) {
+DARK_NOINLINE void copyEngineBytes(void* output,const void* input,size_t size) {
     std::memcpy(output,input,size);
 }
-__declspec(noinline) bool equalEngineBytes(const void* expected,const void* input,size_t size) {
+DARK_NOINLINE bool equalEngineBytes(const void* expected,const void* input,size_t size) {
     return std::memcmp(expected,input,size)==0;
 }
 }
@@ -340,12 +429,14 @@ bool queuedSubtitleContext(uint8_t* base, uint32_t manager, uint32_t draw, uint6
     return false;
 }
 
+#if !defined(__PROSPERO__)
 bool copyRenderMemory(uint8_t* base, uint64_t address, void* output, size_t size) {
     if (!base || !output || !address || address >= 0x100000000ull || size > 0x100000000ull-address) return false;
     // The AOT engine shares this process. Avoid a kernel transition for each
     // small draw-state read while still rejecting inaccessible/decommitted
     // ranges, including a decommit that races the copy. Callers publish only
     // complete snapshots and keep their existing source-stability checks.
+#if defined(_WIN32)
     __try {
         copyEngineBytes(output,base+address,size);
         return true;
@@ -355,16 +446,29 @@ bool copyRenderMemory(uint8_t* base, uint64_t address, void* output, size_t size
             std::fprintf(stderr,"[RenderMemoryFault] source=%08llX bytes=%zu\n",address,size);
         return false;
     }
+#else
+    // The console's guest space is one committed 4 GB mapping, so the range
+    // check above is the whole guard: an address inside it cannot fault the
+    // title the way a Windows decommit can. The copy stays out of line for the
+    // same reason it does on Windows (the faulting loads live in the callee).
+    copyEngineBytes(output,base+address,size);
+    return true;
+#endif
 }
 bool equalRenderMemory(uint8_t* base,uint64_t address,const void* expected,size_t size) {
     if(!base || !expected || !address || address>=0x100000000ull || size>0x100000000ull-address)return false;
+#if defined(_WIN32)
     __try {
         return equalEngineBytes(expected,base+address,size);
     } __except(GetExceptionCode()==EXCEPTION_ACCESS_VIOLATION || GetExceptionCode()==EXCEPTION_IN_PAGE_ERROR
                ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         renderMemoryFaults.fetch_add(1,std::memory_order_relaxed);return false;
     }
+#else
+    return equalEngineBytes(expected,base+address,size);
+#endif
 }
+#endif
 void setPreviewTextureBudget(size_t bytes) {
     std::lock_guard lock(queueMutex);
     const auto next=std::clamp(bytes,size_t(256*1024*1024),size_t(2ull*1024*1024*1024));
@@ -1087,14 +1191,20 @@ void previewObserveTriangles(uint8_t* base, uint32_t indices, uint32_t triangles
     submitTriangles(base, indices, triangles);
 }
 template<class Geometry>
-static void previewObserveWorldInto(uint8_t* base,Geometry&& geometry) {
+static void previewObserveWorldInto(uint8_t* base,Geometry&& geometry,std::shared_ptr<WorldDraw> draw={}) {
     EngineCpuScope profile(EnginePhase::snapshot);
     if (!active) return;
     worldActive=true;
     try {
-        auto draw=captureWorldDraw(base,std::forward<Geometry>(geometry));
+        if(!draw) {
+            // Split the read-only guest capture from the queue work below: the
+            // two together are this draw's share of the engine thread's frame.
+            EngineCpuScope capture(EnginePhase::worldCapture);
+            draw=captureWorldDraw(base,std::forward<Geometry>(geometry));
+        }
         if(!draw)return;
-        std::unique_lock lock(queueMutex);
+        std::unique_lock lock(queueMutex,std::defer_lock);
+        {EngineCpuScope sample(EnginePhase::queueLock);lock.lock();}
         ++pendingCounts.worldDraws;
         // Draws retain shared immutable buffers. Count each retained resource
         // once, not once per depth/light/fog/material pass. UI vertices are
@@ -1128,18 +1238,23 @@ static void previewObserveWorldInto(uint8_t* base,Geometry&& geometry) {
                 frames.load()+1,draw->fragmentName.c_str(),pending.size(),pendingWorldVertices,pendingGeometry.size(),pendingGeometryBytes,additionalVertices);
             return;
         }
+        {
+        EngineCpuScope sample(EnginePhase::queueTextures);
         for (uint32_t slots=draw->textureMask;slots;slots&=slots-1) {
             const unsigned s=std::countr_zero(slots);
             if(!draw->textureObjects[s].object || !draw->textureIds[s])continue;
             const auto it=colorTextures.find(draw->textureIds[s]);
             if(it==colorTextures.end())continue;
             const auto& texture=draw->textureObjects[s];const auto& sampler=draw->samplers[s];
+            if(it->second.resource && it->second.resource!=texture.object)
+                worldTextureKeyClashes.fetch_add(1,std::memory_order_relaxed);
             if(it->second.resource && (it->second.resource!=texture.object ||
                it->second.image->width!=texture.width || it->second.image->height!=texture.height ||
                it->second.image->faces!=texture.faces))continue;
             const auto required=(std::max)(texture.firstMip,sampler.lodValid?unsigned(sampler.minLevel):0u);
             if(it->second.image->firstMip>required)continue;
             draw->textures[s]=it->second.image;it->second.used=++colorUse;
+            worldTextureCacheHits.fetch_add(1,std::memory_order_relaxed);
         }
         for (uint32_t slots=draw->textureMask;slots;slots&=slots-1) {
             const unsigned s=std::countr_zero(slots);
@@ -1186,8 +1301,26 @@ static void previewObserveWorldInto(uint8_t* base,Geometry&& geometry) {
                    // Other World's grain uses authored noise at slot1; its
                    // scene0/depth2 and final OW1_2 inputs stay GPU resolves.
                    (draw->fragmentName=="WClientMod_OW1_1" && s==1)) {
+                    const uint32_t object=draw->textureObjects[s].object;
+                    const unsigned decodeMip=draw->textureObjects[s].firstMip;
+                    // GPU-resolved surfaces have no CPU pixels to decode, and a
+                    // decode that just failed for this resource and mip will
+                    // fail again this second. Skipping either costs nanoseconds;
+                    // attempting it costs milliseconds.
+                    if(isResolvedObject(object) || worldDecodeRecentlyFailed(object,decodeMip))continue;
                     auto decoded=std::make_shared<ColorImage>();
-                    if(!decodeWorldTextureImage(base,draw->textureObjects[s].object,*decoded,draw->textureObjects[s].firstMip)) {
+                    // A world texture is decoded from the guest every time its id
+                    // has no usable cache entry, and that decode walks the whole
+                    // mip chain. Count, time and name it: at 300 draws per frame
+                    // it is either a one-off per texture or the frame's budget.
+                    const auto decodeStart=std::chrono::steady_clock::now();
+                    const char* decodeError=decodeWorldTextureImage(base,object,*decoded,decodeMip);
+                    worldTextureDecodeNanoseconds.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now()-decodeStart).count()),std::memory_order_relaxed);
+                    worldTextureDecodeAttempts.fetch_add(1,std::memory_order_relaxed);
+                    if(noteWindowDecode(object,draw->textureIds[s],decoded->width,decoded->height))
+                        worldTextureDecodeRepeats.fetch_add(1,std::memory_order_relaxed);
+                    if(!decodeError) {
                         // Original82256008 fills video storage directly with
                         // decoder V,U bytes, without the initial upload's
                         // temporary pair swap. Fetch10 endian/selector decoding
@@ -1197,14 +1330,28 @@ static void previewObserveWorldInto(uint8_t* base,Geometry&& geometry) {
                         }
                         if (makeColorCacheRoom(decoded->bytes())) {
                             colorBytes+=decoded->bytes();colorTextures[draw->textureIds[s]]={decoded,++colorUse,draw->textureObjects[s].object};
+                            worldTextureDecodeInstalls.fetch_add(1,std::memory_order_relaxed);
+                        } else {
+                            // Decoded pixels this draw can use, but the cache
+                            // cannot hold them: the next draw of the same
+                            // resource decodes it again.
+                            worldTextureDecodeBudgetRejects.fetch_add(1,std::memory_order_relaxed);
                         }
                         draw->textures[s]=decoded;++colorImages;
                         if (TextureUploadTraceEnabled())
                             std::fprintf(stderr,"[EngineStreamedTexture] owned id=%u size=%ux%u format=%u\n",draw->textureIds[s],decoded->width,decoded->height,draw->textureObjects[s].format);
+                    } else {
+                        recordWorldDecodeFailure(object,decodeMip);
+                        worldTextureDecodeFailures.fetch_add(1,std::memory_order_relaxed);
+                        if(worldTextureDecodeReasonsPrinted.fetch_add(1,std::memory_order_relaxed)<8)
+                            std::fprintf(stderr,"[EngineWorldImageDecodeFail] frame=%llu object=%08X id=%u mip=%u reason=%s\n",
+                                static_cast<unsigned long long>(frames.load(std::memory_order_relaxed)),object,draw->textureIds[s],decodeMip,decodeError);
                     }
                 }
             }
         }
+        }
+        EngineCpuScope sampleAccounting(EnginePhase::queueAccounting);
         // Capture only distinct images used by this draw. Reuse this short
         // list if a budget boundary publishes the pending batch; all image
         // ownership stays in draw while the non-owning list is in use.
@@ -1237,7 +1384,7 @@ static void previewObserveWorldInto(uint8_t* base,Geometry&& geometry) {
         for(size_t i=0;i<imageCount;++i)pendingWorldImages.insert(images[i]);
         pendingWorldImageBytes+=additionalImageBytes;
         SimpleMesh command;command.promptContext=draw->promptContext;
-        command.world=std::move(draw);pending.push_back(std::move(command));
+        command.world=QueuedWorldDrawAccess::seal(std::move(draw));pending.push_back(std::move(command));
         ++worldQueued;
     } catch (...) {}
 }
@@ -1246,6 +1393,35 @@ void previewObserveWorld(uint8_t* base,const StoredDraw& geometry) {
 }
 void previewObserveWorld(uint8_t* base,StoredDraw&& geometry) {
     previewObserveWorldInto(base,std::move(geometry));
+}
+void previewObserveWorldUnbound(uint8_t* base,StoredDraw&& geometry) {
+    if(!active || !geometry)return;
+    std::shared_ptr<WorldDraw> draw;
+    {
+        EngineCpuScope sample(EnginePhase::worldCapture);
+        const bool native=nativeWorldCaptureEnabled.load(std::memory_order_relaxed) &&
+            nativeWorldCaptureSafe.load(std::memory_order_relaxed);
+        if(native && nativeWorldCaptureCompare.load(std::memory_order_relaxed)) {
+            auto referenceGeometry=geometry;
+            std::shared_ptr<WorldDraw> reference;
+            if(captureEngineVertexBindings(base,referenceGeometry.vertexBindings))
+                reference=captureWorldDrawCanonical(base,referenceGeometry);
+            draw=captureNativeWorldDraw(base,geometry);
+            if(draw && (!reference || !equivalentWorldCaptures(*draw,*reference))) {
+                rejectNativeWorldCaptureComparison();
+                std::fprintf(stderr,"[NativeWorldCapture] comparison mismatch; original path retained for this session\n");
+                draw=std::move(reference);
+            } else if(!draw)draw=std::move(reference);
+            if(!draw)return;
+        } else {
+            if(native)draw=captureNativeWorldDraw(base,geometry);
+            if(!draw) {
+                if(!captureEngineVertexBindings(base,geometry.vertexBindings))return;
+                draw=captureWorldDraw(base,std::move(geometry));
+            }
+        }
+    }
+    if(draw)previewObserveWorldInto(base,std::move(geometry),std::move(draw));
 }
 void previewObserveImmediateWorld(uint8_t* base,uint32_t device,uint32_t indices,uint32_t count) {
     if (!active || !worldActive || !device || uint64_t(device)+12456>0x100000000ull) return;
@@ -1325,6 +1501,7 @@ void previewObserveResolve(uint8_t* base,uint32_t device,uint32_t flags,uint32_t
     try {
         auto resolve=std::make_shared<WorldResolve>();
         if(!snapshotWorldResolve(base,device,flags,rectangle,destination,offset,color,depth,stencil,face,mip,*resolve)) return;
+        recordResolvedObject(destination);
         std::unique_lock lock(queueMutex);if(!reservePreviewCommand(lock)) {++pendingCounts.resolveDrops;return;}
         SimpleMesh command;command.worldResolve=std::move(resolve);pending.push_back(std::move(command));
     }catch(...){}
@@ -1334,6 +1511,7 @@ void previewObservePresent(uint8_t* base,uint32_t frontbuffer) {
     try {
         auto texture=std::make_shared<WorldTexture>();
         if(!snapshotWorldTexture(base,frontbuffer,*texture)) return;
+        recordResolvedObject(frontbuffer);
         std::unique_lock lock(queueMutex);
         if(liveStreaming())reservePreviewCommand(lock);
         SimpleMesh command;command.worldPresent=std::move(texture);pending.push_back(std::move(command));
@@ -1361,9 +1539,10 @@ void previewObserveDisplayGamma(uint8_t* base,uint32_t ramp,bool piecewise) {
         previous=std::move(table);
     }catch(...){}
 }
-void setPreviewFrameBackpressure(bool enabled,bool streaming) {
-    {std::lock_guard lock(queueMutex);frameBackpressure=enabled;streamLargeFrames=enabled && streaming;}
-    if(!enabled)frameConsumed.notify_all();
+void setPreviewFrameBackpressure(bool enabled,bool streaming,unsigned bufferedParts) {
+    {std::lock_guard lock(queueMutex);frameBackpressure=enabled;streamLargeFrames=enabled && streaming;
+     readyPartLimit=streamLargeFrames?std::clamp(bufferedParts,1u,8u):1u;}
+    frameConsumed.notify_all();
 }
 void previewBeginHistogram(unsigned bin) {
     if(!active || !worldActive || bin>=histogramResults.size() || activeHistogram || activeFlare)return;
@@ -1414,12 +1593,15 @@ bool previewReadFlare(unsigned id,uint64_t& samples) {
 }
 namespace {
 void publishPreviewPart(std::unique_lock<std::mutex>& lock,bool last) {
+    EngineCpuScope sample(EnginePhase::queuePublish);
     {
         const auto* ctx=currentContext;
         StallProfiler::Scope stallWait(StallProfiler::Section::Wait, "preview frame producer backpressure",
             ctx ? ctx->lastFunction : 0, ctx ? uint32_t(ctx->lr) : 0,
             reinterpret_cast<uint64_t>(&frameConsumed), "frameConsumed condition variable");
-        frameConsumed.wait(lock,[]{return !frameBackpressure || !frameReady;});
+        EngineCpuScope sampleWait(EnginePhase::queueWait);
+        frameConsumed.wait(lock,[]{return !frameBackpressure || (readyParts.size()<readyPartLimit &&
+            (readyParts.empty() || !readyParts.back().part.last));});
     }
     pendingCounts.commands+=pending.size();++pendingCounts.parts;
     for(const auto& command:pending)if(command.world)++pendingCounts.passes[size_t(command.world->material)];
@@ -1440,16 +1622,24 @@ void publishPreviewPart(std::unique_lock<std::mutex>& lock,bool last) {
     }
     pendingCounts={};pendingGuiDraws=0;++frames;
     }
-    readyPart={pendingFirst,last};pendingFirst=last;
-    ready = std::move(pending); pending.clear();
+    std::vector<ReadyPreviewPart> retired;
+    if(!frameBackpressure) {
+        // Latest-frame mode retains its replacement behavior. The live path
+        // allocates no temporary retirement container on each publication.
+        retired.reserve(readyParts.size());
+        while(!readyParts.empty()) {retired.push_back(std::move(readyParts.front()));readyParts.pop_front();}
+    }
+    readyParts.push_back({std::move(pending),{pendingFirst,last}});pendingFirst=last;
+    pending.clear();
     // The consumer returns only empty storage. Reuse capacity without moving
     // thousands of commands through the vector's growth stages every frame.
     pending.swap(recycledFrame);
     if(pending.capacity())frameBufferReuses.fetch_add(1,std::memory_order_relaxed);
     pendingVertices = pendingVideoBytes = pendingColorBytes = 0;
     pendingGeometry.clear();pendingGeometryBytes=pendingWorldVertices=0;
-    pendingWorldImages.clear();pendingWorldImageBytes=0;frameReady = true;
+    pendingWorldImages.clear();pendingWorldImageBytes=0;
     lock.unlock();frameAvailable.notify_one();
+    retired.clear(); // Retained resources must never be destroyed under queueMutex.
     lock.lock();
 }
 }
@@ -1466,7 +1656,53 @@ void previewEndFrame() {
     }
     publishPreviewPart(lock,true);
 }
+// Background retirement: the consumer hands each finished part to a worker
+// that destroys its draw snapshots, instead of spending its own time on that
+// before it can take the next part (20% of the PS5 render thread in a busy
+// scene). At most kRetireBacklog parts wait; past that the consumer retires
+// inline, so a slow worker bounds memory rather than growing it.
+namespace {
+constexpr size_t kRetireBacklog=4;
+std::mutex retireMutex;
+std::condition_variable retireReady;
+std::deque<std::vector<SimpleMesh>> retireQueue;
+std::thread retireWorker;
+bool retireStopping=false;
+std::atomic<bool> backgroundRetire{false};
+void recyclePreviewFrame(std::vector<SimpleMesh>& completed) {
+    // Never destroy retained resources under queueMutex. Publish only the
+    // cleared allocation, retaining at most one spare command buffer.
+    std::lock_guard recycleLock(queueMutex);
+    if(completed.capacity()>recycledFrame.capacity())completed.swap(recycledFrame);
+}
+void retireLoop() {
+    std::unique_lock lock(retireMutex);
+    for(;;) {
+        retireReady.wait(lock,[]{return retireStopping || !retireQueue.empty();});
+        if(retireQueue.empty())return;
+        auto completed=std::move(retireQueue.front());retireQueue.pop_front();
+        lock.unlock();
+        completed.clear();
+        recyclePreviewFrame(completed);
+        lock.lock();
+    }
+}
+}
+void setPreviewBackgroundRetirement(bool enabled) {
+    if(enabled==backgroundRetire.load())return;
+    if(enabled) {
+        {std::lock_guard lock(retireMutex);retireStopping=false;}
+        retireWorker=std::thread(retireLoop);
+        backgroundRetire.store(true);
+        return;
+    }
+    backgroundRetire.store(false);
+    {std::lock_guard lock(retireMutex);retireStopping=true;}
+    retireReady.notify_all();
+    if(retireWorker.joinable())retireWorker.join(); // drains the backlog first
+}
 bool takePreviewFrame(std::vector<SimpleMesh>& frame,unsigned waitMilliseconds,PreviewFramePart* part) {
+    setRenderSamplePhase(RenderSamplePhase::wait);
     StallProfiler::Scope stallRender(StallProfiler::Section::Rendering, "takePreviewFrame");
     std::unique_lock lock(queueMutex,std::defer_lock);
     {
@@ -1474,25 +1710,79 @@ bool takePreviewFrame(std::vector<SimpleMesh>& frame,unsigned waitMilliseconds,P
             0,0,reinterpret_cast<uint64_t>(&queueMutex),"preview queue mutex");
         lock.lock();
     }
-    if(waitMilliseconds && !frameReady) {
+    if(waitMilliseconds && readyParts.empty()) {
         StallProfiler::Scope stallWait(StallProfiler::Section::Wait, "preview frame consumer wait",
             0,0,reinterpret_cast<uint64_t>(&frameAvailable),"frameAvailable condition variable");
-        frameAvailable.wait_for(lock,std::chrono::milliseconds(waitMilliseconds),[]{return frameReady;});
+        frameAvailable.wait_for(lock,std::chrono::milliseconds(waitMilliseconds),[]{return !readyParts.empty();});
     }
-    if (!frameReady) return false;
-    if(part)*part=readyPart;
-    auto completed=std::move(ready);ready.clear();frameReady=false;
+    if (readyParts.empty()) return false;
+    if(part)*part=readyParts.front().part;
+    auto completed=std::move(readyParts.front().commands);readyParts.pop_front();
     lock.unlock();frameConsumed.notify_one();
+    setRenderSamplePhase(RenderSamplePhase::retire);
     // Retiring thousands of draw snapshots must not hold the producer's
     // queue lock. Their immutable shared resources outlive either frame.
     frame.swap(completed);
-    completed.clear();
-    // Never destroy retained resources under queueMutex. Publish only the
-    // cleared allocation, retaining at most one spare command buffer.
-    {std::lock_guard recycleLock(queueMutex);
-        if(completed.capacity()>recycledFrame.capacity())completed.swap(recycledFrame);
+    if(backgroundRetire.load(std::memory_order_relaxed)) {
+        std::unique_lock retireLock(retireMutex);
+        if(retireQueue.size()<kRetireBacklog) {
+            retireQueue.push_back(std::move(completed));
+            retireLock.unlock();retireReady.notify_one();
+            setRenderSamplePhase(RenderSamplePhase::other);
+            return true;
+        }
     }
+    completed.clear();
+    recyclePreviewFrame(completed);
+    setRenderSamplePhase(RenderSamplePhase::other);
     return true;
+}
+// The world-image decode window: what was attempted, what failed, and, when
+// attempts repeat, which resources they repeat on. Every value resets on read.
+static void printWorldImageDecodeCounters() {
+    const uint64_t attempts=worldTextureDecodeAttempts.exchange(0,std::memory_order_relaxed);
+    const uint64_t failures=worldTextureDecodeFailures.exchange(0,std::memory_order_relaxed);
+    const uint64_t nanoseconds=worldTextureDecodeNanoseconds.exchange(0,std::memory_order_relaxed);
+    const uint64_t hits=worldTextureCacheHits.exchange(0,std::memory_order_relaxed);
+    const uint64_t installs=worldTextureDecodeInstalls.exchange(0,std::memory_order_relaxed);
+    const uint64_t repeats=worldTextureDecodeRepeats.exchange(0,std::memory_order_relaxed);
+    const uint64_t rejects=worldTextureDecodeBudgetRejects.exchange(0,std::memory_order_relaxed);
+    const uint64_t clashes=worldTextureKeyClashes.exchange(0,std::memory_order_relaxed);
+    worldTextureDecodeReasonsPrinted.store(0,std::memory_order_relaxed);
+    std::fprintf(stderr,"[EngineWorldImageDecode] attempts=%llu failures=%llu ms=%.2f cacheHits=%llu installs=%llu repeats=%llu budgetRejects=%llu keyClashes=%llu\n",
+        attempts,failures,double(nanoseconds)/1e6,hits,installs,repeats,rejects,clashes);
+    std::array<WindowDecodeTally,4> top{};
+    size_t topCount=0;
+    {
+        std::lock_guard lock(windowDecodeMutex);
+        std::array<WindowDecodeTally,64> sorted{};
+        const size_t count=(std::min)(windowDecodeCount,windowDecodes.size());
+        std::copy_n(windowDecodes.begin(),count,sorted.begin());
+        for(size_t i=0;i<count;++i) {
+            size_t best=i;
+            for(size_t j=i+1;j<count;++j) if(sorted[j].count>sorted[best].count) best=j;
+            std::swap(sorted[i],sorted[best]);
+        }
+        topCount=(std::min)(count,top.size());
+        std::copy_n(sorted.begin(),topCount,top.begin());
+        windowDecodeCount=0;
+        windowDecodes={};
+    }
+    if(!topCount)return;
+    char line[420]{},entry[96]{};
+    size_t used=std::snprintf(line,sizeof line,"[EngineWorldImageDecodeTop]");
+    for(size_t i=0;i<topCount && used<sizeof line;++i) {
+        std::snprintf(entry,sizeof entry," %08X id=%u %ux%u x%u",top[i].object,top[i].id,top[i].width,top[i].height,top[i].count);
+        used+=std::snprintf(line+used,sizeof line-used,"%s",entry);
+    }
+    std::fprintf(stderr,"%s\n",line);
+}
+// Two engine-thread readings a frame-rate investigation takes mid-run: how
+// often a skinned palette was reused, and where world image decoding went.
+// Both reset on read like the window counters they belong beside.
+void printWorldCaptureCounters() {
+    printWorldPaletteProofCounters();
+    printWorldImageDecodeCounters();
 }
 void printPreviewCounters() {
     if (!active) return;
@@ -1506,6 +1796,7 @@ void printPreviewCounters() {
     std::fprintf(stderr,"[EngineQueueStreaming] intermediateParts=%llu imageBudgetDrops=%llu partCommandLimit=%zu geometryMiB=%zu imageMiB=%zu\n",
         streamedParts.load(),worldImageBudgetDrops.load(),livePartCommands,worldGeometryByteLimit/(1024*1024),worldImageByteLimit/(1024*1024));
     std::fprintf(stderr,"[EngineFrameBuffers] reused=%llu\n",frameBufferReuses.load(std::memory_order_relaxed));
+    printWorldImageDecodeCounters();
     printEngineTextureCounters();
     printEngineVertexDescriptorCounters();
     printEnginePaletteCounters();

@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1138,11 +1139,12 @@ namespace {
 // Observe the exact queue record already selected by the original guest,
 // without a kernel query, permanent permission cache, or guest write. Keep
 // memcpy out of the SEH function so optimized loads remain under its handler.
-__declspec(noinline) void copyJobBytes(void* output, const void* input, size_t size) {
+DARK_NOINLINE void copyJobBytes(void* output, const void* input, size_t size) {
     std::memcpy(output, input, size);
 }
 bool jobBytes(uint8_t* base, uint64_t address, void* output, size_t size) {
     if (!base || !address || address >= 0x100000000ull || size > 0x100000000ull - address) return false;
+#if defined(_WIN32)
     __try {
         copyJobBytes(output, base + address, size);
         return true;
@@ -1150,6 +1152,12 @@ bool jobBytes(uint8_t* base, uint64_t address, void* output, size_t size) {
                 ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         return false;
     }
+#else
+    // As in copyRenderMemory: the console's guest space is one committed
+    // mapping, so the range check is the guard.
+    copyJobBytes(output, base + address, size);
+    return true;
+#endif
 }
 struct ResourceJobSnapshot {
     uint32_t type = 0, busyByte = 0;
@@ -1554,6 +1562,8 @@ PPC_FUNC(sub_82868FE8) {
     // Observe the engine's actual indexed call, after its early-out checks
     // and buffer binding. This does not interpret the Xbox command stream.
     if (drawingGeometry && drawingGeometry->matches(uint32_t(ctx.lr),ctx.r4.u32,ctx.r5.u32,ctx.r6.u32,ctx.r7.u32)) {
+        const bool unboundCapture=!enabled && DarkRecomp::Native::nativeWorldCaptureEnabled.load(std::memory_order_relaxed) &&
+            DarkRecomp::Native::nativeWorldCaptureSafe.load(std::memory_order_relaxed);
         DarkRecomp::Native::StoredDraw owned;
         const uint32_t device = ctx.r3.u32;
         if (DarkRecomp::Native::enginePreviewEnabled() && !word(base, renderContext + 16512) &&
@@ -1566,7 +1576,8 @@ PPC_FUNC(sub_82868FE8) {
             if (owned) {
                 DarkRecomp::Native::EngineTransformSnapshot transform;
                 if (enabled && DarkRecomp::Native::snapshotEngineTransforms(base, transform)) owned.transforms = transform;
-                DarkRecomp::Native::captureEngineVertexBindings(base,owned.vertexBindings);
+                if(!unboundCapture)
+                    DarkRecomp::Native::captureEngineVertexBindings(base,owned.vertexBindings);
             }
         }
         static std::atomic<uint64_t> calls{0};
@@ -1576,7 +1587,9 @@ PPC_FUNC(sub_82868FE8) {
         }
         if (owned) {
             const auto floatingPointMode=_mm_getcsr();
-            DarkRecomp::Native::previewObserveWorld(base,std::move(owned));
+            if(unboundCapture)
+                DarkRecomp::Native::previewObserveWorldUnbound(base,std::move(owned));
+            else DarkRecomp::Native::previewObserveWorld(base,std::move(owned));
             _mm_setcsr(floatingPointMode);
         }
     }
@@ -1624,7 +1637,8 @@ PPC_FUNC(sub_82868FE8) {
         }
         _mm_setcsr(mode);
     }
-    __imp__sub_82868FE8(ctx, base);
+    {DarkRecomp::Native::EngineCpuScope sample(DarkRecomp::Native::EnginePhase::drawOriginal);
+    __imp__sub_82868FE8(ctx, base);}
 }
 extern "C" PPC_FUNC(__imp__sub_828630D8);
 PPC_FUNC(sub_828630D8) {
@@ -1675,6 +1689,29 @@ PPC_FUNC(sub_82867620) {
     captureWorldBoundary(0x82867620,ctx,base);
     const auto mxcsr=_mm_getcsr();
     if(DarkRecomp::Native::previewWorldActive()) {
+#if !defined(_WIN32)
+        // Compare the producer's cadence with host presentation. A regular
+        // display can still show uneven motion if guest updates arrive in bursts.
+        using Clock = std::chrono::steady_clock;
+        static auto previous = Clock::time_point{};
+        static std::array<double,120> intervals{};
+        static size_t count = 0;
+        const auto now = Clock::now();
+        if(previous != Clock::time_point{}) {
+            intervals[count++] = std::chrono::duration<double,std::milli>(now-previous).count();
+            if(count == intervals.size()) {
+                auto sorted = intervals;
+                std::sort(sorted.begin(),sorted.end());
+                double sum = 0;
+                unsigned longFrames = 0, shortFrames = 0;
+                for(double ms : intervals) {sum += ms;longFrames += ms>25;shortFrames += ms<8;}
+                std::fprintf(stderr,"[GuestCadence] meanMs=%.2f minMs=%.2f p95Ms=%.2f maxMs=%.2f over25Ms=%u under8Ms=%u\n",
+                    sum/intervals.size(),sorted.front(),sorted[113],sorted.back(),longFrames,shortFrames);
+                count = 0;
+            }
+        }
+        previous = now;
+#endif
         DarkRecomp::Native::previewObservePresent(base,ctx.r4.u32);
         DarkRecomp::Native::previewEndFrame();
         // World frames finish at the original SDK swap entry. Count this

@@ -59,6 +59,18 @@ def archive_reads(data):
 
 
 class VideoMenu(unittest.TestCase):
+    def test_ps5_video_page_omits_window_and_keyboard_controls(self):
+        output = compile_menu(self.source, platform="ps5")
+        for registry, _ in registries(output):
+            page, = [n for n in registry.roots if registry.decode(n) == ("WINDOW", "options_video")]
+            actions = []
+            for node in page.children:
+                if registry.decode(node)[0] != "WINDOW": continue
+                props = dict(registry.decode(c) for c in node.children)
+                if props.get("CLASSNAME") == "CubeButton": actions.append(props["SCRIPT_PRESSED"])
+            self.assertEqual(actions, ["darkrecomp." + key for key in SETTINGS if key not in ("mode", "vsync")])
+            self.assertFalse(any(registry.decode(n) == ("WINDOW", "darkrecomp_exit_confirm") for n in registry.roots))
+
     @classmethod
     def setUpClass(cls):
         cls.source = (GAME / "Content/Gui/CubeWnd.xcr").read_bytes()

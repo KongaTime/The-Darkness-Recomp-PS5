@@ -1,6 +1,6 @@
 #include "engine_vertex_descriptor.h"
 #include "simple_mesh.h"
-#include <Windows.h>
+#include "runtime/native/windows_shim.h"
 #include <atomic>
 #include <bit>
 #include <cstdio>

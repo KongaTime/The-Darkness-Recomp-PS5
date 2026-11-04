@@ -1,24 +1,31 @@
 #pragma once
-#include <windows.h>
+#include "runtime/native/windows_shim.h"
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 
 namespace DarkRecomp::Native {
-enum class EnginePhase { stored, immediate, indexed, vertexProgram, descriptor, conversion, textures, palette, snapshot, handoff, sleep,
-                         queryXma, queryKernel, queryDispatcher, queryAudio, queryFile, queryDispatcherWorkingSet, count };
+enum class EnginePhase { stored, immediate, indexed, vertexProgram, descriptor, conversion, textures, palette, snapshot, worldCapture, handoff, sleep,
+                         queryXma, queryKernel, queryDispatcher, queryAudio, queryFile, queryDispatcherWorkingSet,
+                         geometryResolve, bindingCapture, drawAllocation, vertexConstants, queueLock, queueTextures,
+                         queueAccounting, queuePublish, drawOriginal, queueWait, count };
 struct EnginePhaseCounters {std::atomic<uint64_t> nanoseconds{}, calls{};};
 inline std::array<EnginePhaseCounters,size_t(EnginePhase::count)> enginePhases;
 inline bool profileEngineCpu=false; // Set before starting the engine thread.
+// Opt-in sampling avoids clock reads and counter atomics on every draw. Only
+// the registered guest producer publishes phases; audio/workers cannot replace it.
+inline std::atomic<bool> sampleEngineCpu{false};
+inline thread_local bool sampleEngineThread=false;
+inline std::atomic<unsigned> sampledEnginePhase{unsigned(EnginePhase::count)};
 inline bool sampleRendererCpu=false; // Opt-in; set before any rendering starts.
-enum class RenderSamplePhase : unsigned { other,textures,geometry,constants,indices,states,submit,clear,resolve,copy,queries,frame,count };
+enum class RenderSamplePhase : unsigned { other,textures,geometry,constants,indices,states,submit,clear,resolve,copy,queries,frame,retire,wait,count };
 inline constexpr std::array<const char*,size_t(RenderSamplePhase::count)> renderSamplePhaseNames{
-    "other","textures","geometry","constants","indices","states","submit","clear","resolve","copy","queries","frame"};
+    "other","textures","geometry","constants","indices","states","submit","clear","resolve","copy","queries","frame","retire","wait"};
 inline std::atomic<unsigned> renderSamplePhase{unsigned(RenderSamplePhase::other)};
 static_assert(std::atomic<unsigned>::is_always_lock_free);
 inline void setRenderSamplePhase(RenderSamplePhase phase) {
-    if(sampleRendererCpu)renderSamplePhase.store(unsigned(phase),std::memory_order_relaxed);
+    if(sampleRendererCpu || sampleEngineCpu.load(std::memory_order_relaxed))renderSamplePhase.store(unsigned(phase),std::memory_order_relaxed);
 }
 inline std::atomic<uint64_t> renderMemoryFaults{};
 inline std::array<std::atomic<unsigned>,256> engineFrameProcessors{};
@@ -41,9 +48,18 @@ class EngineCpuScope {
     EnginePhase phase_;
     Clock::time_point start_;
     bool enabled_;
+    bool sampled_ = false;
+    unsigned previousPhase_ = unsigned(EnginePhase::count);
 public:
-    explicit EngineCpuScope(EnginePhase phase,bool active=true):phase_(phase),enabled_(profileEngineCpu && active) {if(enabled_)start_=Clock::now();}
+    explicit EngineCpuScope(EnginePhase phase,bool active=true):phase_(phase),enabled_(profileEngineCpu && active) {
+        if(sampleEngineCpu.load(std::memory_order_relaxed) && sampleEngineThread && active) {
+            sampled_=true;
+            previousPhase_=sampledEnginePhase.exchange(unsigned(phase),std::memory_order_relaxed);
+        }
+        if(enabled_)start_=Clock::now();
+    }
     ~EngineCpuScope() {
+        if(sampled_)sampledEnginePhase.store(previousPhase_,std::memory_order_relaxed);
         if(!enabled_)return;
         auto& counter=enginePhases[size_t(phase_)];
         counter.nanoseconds.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start_).count(),std::memory_order_relaxed);
@@ -58,19 +74,21 @@ inline SIZE_T engineProfileVirtualQuery(EnginePhase phase,LPCVOID address,
     EngineCpuScope query(phase);
     return VirtualQuery(address,info,bytes);
 }
-inline void printEngineCpuPerformance() {
+inline void writeEngineCpuPerformance(std::FILE* out) {
     if(!profileEngineCpu)return;
-    constexpr const char* names[]{"stored","immediate","indexed","vertexProgram","descriptor","conversion","textures","palette","snapshot","handoff","mainSleep",
-                                 "vqXma","vqKernel","vqDispatcher","vqAudio","vqFile","wsDispatcher"};
+    constexpr const char* names[]{"stored","immediate","indexed","vertexProgram","descriptor","conversion","textures","palette","snapshot","worldCapture","handoff","mainSleep",
+                                 "vqXma","vqKernel","vqDispatcher","vqAudio","vqFile","wsDispatcher",
+                                 "geometryResolve","bindingCapture","drawAllocation","vertexConstants","queueLock","queueTextures",
+                                 "queueAccounting","queuePublish","drawOriginal","queueWait"};
     static_assert(std::size(names)==size_t(EnginePhase::count));
-    std::fprintf(stderr,"[EngineCPU] inclusiveMs");
+    std::fprintf(out,"[EngineCPU] inclusiveMs");
     for(size_t i=0;i<enginePhases.size();++i) {
         const auto ns=enginePhases[i].nanoseconds.exchange(0,std::memory_order_relaxed);
         const auto calls=enginePhases[i].calls.exchange(0,std::memory_order_relaxed);
-        std::fprintf(stderr," %s=%.2f/%llu",names[i],double(ns)/1e6,calls);
+        std::fprintf(out," %s=%.2f/%llu",names[i],double(ns)/1e6,calls);
     }
-    std::fputc('\n',stderr);
-    std::fprintf(stderr,"[DispatcherWorkingSet] acceptedSpans=%llu deniedSpans=%llu apiFallbackSpans=%llu nonresidentFallbackSpans=%llu queriedPages=%llu\n",
+    std::fputc('\n',out);
+    std::fprintf(out,"[DispatcherWorkingSet] acceptedSpans=%llu deniedSpans=%llu apiFallbackSpans=%llu nonresidentFallbackSpans=%llu queriedPages=%llu\n",
         dispatcherWorkingSetAccepted.exchange(0,std::memory_order_relaxed),
         dispatcherWorkingSetDenied.exchange(0,std::memory_order_relaxed),
         dispatcherWorkingSetApiFallback.exchange(0,std::memory_order_relaxed),
@@ -81,11 +99,17 @@ inline void printEngineCpuPerformance() {
     const auto batches=xmaProfileBatchCalls.exchange(0,std::memory_order_relaxed);
     const auto contexts=xmaProfileBatchContexts.exchange(0,std::memory_order_relaxed);
     const auto single=xmaProfileSingleBatches.exchange(0,std::memory_order_relaxed);
-    std::fprintf(stderr,"[XmaBatch] entered=%llu requestedContexts=%llu size1=%llu\n",batches,contexts,single);
-    std::fprintf(stderr,"[RenderMemory] caughtFaults=%llu\n",renderMemoryFaults.load(std::memory_order_relaxed));
-    std::fprintf(stderr,"[EngineProcessors]");
+    std::fprintf(out,"[XmaBatch] entered=%llu requestedContexts=%llu size1=%llu\n",batches,contexts,single);
+    std::fprintf(out,"[RenderMemory] caughtFaults=%llu\n",renderMemoryFaults.load(std::memory_order_relaxed));
+    std::fprintf(out,"[EngineProcessors]");
     for(unsigned i=0;i<engineFrameProcessors.size();++i)
-        if(auto frames=engineFrameProcessors[i].exchange(0,std::memory_order_relaxed))std::fprintf(stderr," %u=%u",i,frames);
-    std::fputc('\n',stderr);
+        if(auto frames=engineFrameProcessors[i].exchange(0,std::memory_order_relaxed))std::fprintf(out," %u=%u",i,frames);
+    std::fputc('\n',out);
+}
+// Windows/native callers keep their stderr block; the console routes the same
+// counters to perf.txt so an FTP-only session can read them.
+inline void printEngineCpuPerformance() {
+    if(!profileEngineCpu)return;
+    writeEngineCpuPerformance(stderr);
 }
 }

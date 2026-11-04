@@ -1,4 +1,5 @@
 #pragma once
+#include "render_memory.h"
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -8,9 +9,6 @@
 // guest container layouts were verified against original vtables 0x82097EF0
 // (VirtualXTC2) and 0x82097B70 (older VirtualXTC). Decorative GUI_Arrow_*
 // textures are deliberately NOT origins: only GUI_Button_* records classify.
-namespace DarkRecomp::Native {
-bool copyRenderMemory(uint8_t* base, uint64_t address, void* output, size_t size);
-}
 namespace DarkRecomp::Prompts {
 enum class Origin : uint8_t {
     Unknown = 0,

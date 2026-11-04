@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/native/atomic_shared_ptr.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -18,8 +19,8 @@ inline BindingLabels defaultGameplayBindingLabels() {
             "3","4","1","2","3/4","1/2","WASD","Mse","WASD/Mse","Ct/Sh"};
 }
 struct BindingLabelSet { BindingLabels menu, gameplay; };
-inline std::atomic<std::shared_ptr<const BindingLabelSet>>& bindingLabelStore() {
-    static std::atomic<std::shared_ptr<const BindingLabelSet>> labels{
+inline AtomicSharedPtr<const BindingLabelSet>& bindingLabelStore() {
+    static AtomicSharedPtr<const BindingLabelSet> labels{
         std::make_shared<const BindingLabelSet>(BindingLabelSet{defaultBindingLabels(), defaultGameplayBindingLabels()})};
     return labels;
 }
